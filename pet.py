@@ -184,6 +184,8 @@ class PikachuPet(QWidget):
                     color = BLACK      # (此版不区分耳尖)
                 elif ch in "⚡":
                     color = QColor(120, 200, 255)  # 电花偏蓝白
+                elif ch == "·":
+                    color = RED                     # 脸颊红点
                 else:
                     color = YELLOW
                 # 描边
