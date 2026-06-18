@@ -1,0 +1,39 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# ── 运行时自动生成的文件(不该进版本库)────────────────
+# 用户的定时任务数据,运行时增删
+scheduled_tasks.json
+# MCP 工具事件流,运行时持续追加
+tool_events.jsonl
+# claude_bridge._ensure_mcp_config() 自动生成
+mcp_config.json
+
+# ── 编辑器 / IDE ────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── macOS ───────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# ── 日志 ────────────────────────────────────────────────
+*.log
