@@ -8,10 +8,16 @@ import sys
 
 from PyQt6.QtWidgets import QApplication
 
+# setup_app_policy 只需生效一次。重复调用会反复调 setActivationPolicy:——在某些
+# macOS 版本上会触发 Dock/菜单栏状态重算(图标闪烁),且每次都重写 objc_msgSend
+# 的全局 argtypes,纯属多余。用模块级 flag 保证只跑一次。
+_app_policy_done = False
+
 
 def setup_app_policy():
-    """Accessory 策略:不显示 Dock 图标 / 菜单栏,但窗口可见可交互。"""
-    if sys.platform != "darwin":
+    """Accessory 策略:不显示 Dock 图标 / 菜单栏,但窗口可见可交互。幂等。"""
+    global _app_policy_done
+    if sys.platform != "darwin" or _app_policy_done:
         return
     try:
         objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.dylib")
@@ -27,6 +33,7 @@ def setup_app_policy():
         send_int = objc.objc_msgSend
         send_int.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
         send_int(ns_app, objc.sel_registerName(b"setActivationPolicy:"), 1)
+        _app_policy_done = True   # 成功才置位:失败时下次启动逻辑可再试
     except Exception as exc:
         print(f"[macOS policy] 设置失败(非致命):{exc}")
 

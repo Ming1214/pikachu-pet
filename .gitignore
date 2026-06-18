@@ -20,6 +20,13 @@ scheduled_tasks.json
 tool_events.jsonl
 # claude_bridge._ensure_mcp_config() 自动生成
 mcp_config.json
+# 锁文件 / 原子写残留临时文件
+scheduled_tasks.json.lock
+scheduled_tasks.json.*.tmp
+# 看门狗:本会话 claude 子进程 pid 登记(退出清理用)
+.watchdog_pids
+# 首次引导标记
+.onboarded
 
 # ── 编辑器 / IDE ────────────────────────────────────────
 .vscode/

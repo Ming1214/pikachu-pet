@@ -42,6 +42,10 @@ class ClaudeWorker(QThread):
     def cancel(self):
         self._cancel.set()
 
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
     def run(self):
         start = time.monotonic()
         stop = threading.Event()
@@ -183,13 +187,41 @@ class ChatWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
         self.resize(440, 580)
         self._worker = None
+        # 取消后仍在跑、已被替换的 worker:保活到自己退出,防 QThread 仍运行被 GC。
+        self._orphans = []
         self._thinking = None
+        # 定宽"正在想"气泡引用:_add_thinking 时赋值、_release_thinking 时清空。
+        # 这里先初始化,免得 _render_thinking 在赋值前被调到要靠 getattr 兜底。
+        self._thinking_fixed = None
+        self._pending_user = ""
         self._history = []
+        # 桌宠本体回调:快通道本地建任务后冒"已记下"确认气泡(与 MCP 路径一致)。
+        # 由 pet.open_chat 创建本窗口后注入;为 None 时不影响聊天功能。
+        self.on_local_schedule = None
+        # 桌宠本体回调:窗关着时后台 claude 跑完了,让本体冒"想好了,双击看"气泡,
+        # 否则用户收了窗就不知道活干完没。由 pet.open_chat 注入;为 None 不影响功能。
+        self.on_background_done = None
         self._build()
 
     def showEvent(self, event):
         super().showEvent(event)
         macos_window.join_all_spaces(self)
+
+    def hideEvent(self, event):
+        """收起/关闭聊天窗 = 只把窗藏起来,【不】中断正在跑的 claude。
+
+        设计:收窗 ≠ 喊停。claude 后台继续干活(和定时任务一致),完成后:
+        重新打开窗就能看到回复;若关着没看到,_reply/_error 仍把气泡写进(隐藏的)
+        消息区,重开即见。真要喊停,点输入栏旁的"✕"取消键(_on_cancel)。
+
+        这里只做一件事:让桌宠本体退出"思考态"(否则窗关了它还在原地一直挠头)。
+        worker 本身不动,thinking 转圈气泡也保留——重开窗时还能看到它在转。
+        """
+        if (self._worker is not None and self._worker.isRunning()
+                and self._thinking is not None):
+            # 暂时通知本体"不用一直挠头了",但 worker 继续;重开窗会重新进思考态。
+            self.thinking_ended.emit()
+        super().hideEvent(event)
 
     # ---------- UI ----------
     def _build(self):
@@ -340,6 +372,7 @@ class ChatWindow(QWidget):
         self._thinking_fixed = b      # 记一下,_reply 时解除定宽
         self._spin_idx = 0
         self._spin_sec = 0
+        self._thinking_tier = 0       # 当前安抚文案档位(0/1/2),换档时才调高度防闪
         row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
         col = QVBoxLayout(); col.setContentsMargins(0, 0, 0, 0); col.setSpacing(1)
         col.addWidget(b)
@@ -366,8 +399,36 @@ class ChatWindow(QWidget):
         label = self._thinking if self._thinking is not None else self._thinking_fixed
         spin = self._SPINNER[self._spin_idx]
         sec_str = str(self._spin_sec).rjust(3).replace(" ", "&nbsp;")
+        # 分级安抚:claude 调用耗时不稳定(冷启动/加载 MCP/后端排队可能拖到几十秒)。
+        # 干读秒会让用户分不清"在慢慢想"还是"卡死了"。按时长换文案,让用户安心等、
+        # 也知道可以点 ✕ 停。
+        s = self._spin_sec
+        if s >= 45:
+            tier, tip = 2, "(有点久…急的话点 ✕ 停下,换简单点的说法~)"
+        elif s >= 20:
+            tier, tip = 1, "(还在想,稍等我一下下~)"
+        else:
+            tier, tip = 0, ""
         label.setText(
-            f"<div style='line-height:150%;'>{spin} 皮卡丘正在想… {sec_str} 秒 ⚡</div>")
+            f"<div style='line-height:150%;'>{spin} 皮卡丘正在想… {sec_str} 秒 ⚡"
+            f"{('<br>' + tip) if tip else ''}</div>")
+        # 仅在【换档】时调整气泡高度(全程最多 2 次),平时不动 → 不闪。气泡宽度
+        # 固定 235,安抚文案够短能放下;多出的第二行需要把固定高度放开重算,
+        # 否则按单行定的高会把第二行截断(就像之前见过的气泡截断)。
+        tier_changed = getattr(self, "_thinking_tier", 0) != tier
+        if tier_changed:
+            self._thinking_tier = tier
+            b = self._thinking_fixed if self._thinking_fixed is not None else self._thinking
+            if b is not None:
+                b.setWordWrap(tier > 0)            # 有第二行时才允许换行
+                b.setMinimumHeight(0)
+                b.setMaximumHeight(16777215)
+                h = b.heightForWidth(235) if tier > 0 else 0
+                if h > 0:
+                    b.setFixedHeight(h)
+                else:
+                    b.adjustSize()
+                    b.setFixedWidth(235)
 
     def _scroll_bottom(self):
         sb = self.scroll.verticalScrollBar()
@@ -384,8 +445,19 @@ class ChatWindow(QWidget):
     # ---------- 发送 ----------
     def _send(self):
         text = self.input.text().strip()
-        if not text or (self._worker and self._worker.isRunning()):
+        if not text:
             return
+        # 当前 worker 仍在跑:
+        # - 未取消(用户没点 ✕,只是手快又发一句)→ 维持"一次只发一句",静默忽略。
+        # - 已取消(用户点了 ✕,但 claude 子进程还没退干净)→ 不能再卡着用户,
+        #   把它"孤儿化"(_orphan_worker)让它自己跑完即弃,放行这次新发送。
+        #   迟到的回复靠 _reply/_error 的 sender 身份比对丢弃,不会串台。
+        if self._worker and self._worker.isRunning():
+            if self._worker.cancelled:
+                self._orphan_worker(self._worker)
+                self._worker = None
+            else:
+                return
         self.input.clear()
         self._add("你", text)
         # 先看是不是在管理定时任务(列出/删除/新建),命中就本地处理,不发 claude
@@ -396,11 +468,58 @@ class ChatWindow(QWidget):
         self._pending_user = text
         self.thinking_started.emit()        # 让桌宠本体进思考态
         recent = self._history[-12:]
-        self._worker = ClaudeWorker(text, history=recent)
-        self._worker.succeeded.connect(self._reply)
-        self._worker.failed.connect(self._error)
-        self._worker.tick.connect(self._tick)
-        self._worker.start()
+        w = ClaudeWorker(text, history=recent)
+        # 关键:lambda 捕获【发出信号的这个 worker 实例】,回调里比对 self._worker
+        # 是否仍是它。否则——用户取消 A 后立刻发 B,self._worker 已换成 B,
+        # A 的迟到 succeeded 会用 B 的 cancelled(False)通过守卫,把 A 的回复
+        # 串台写进 B 的对话和历史(污染多轮上下文)。靠身份比对而非 cancelled 旗标。
+        w.succeeded.connect(lambda r, _w=w: self._reply(r, _w))
+        w.failed.connect(lambda e, _w=w: self._error(e, _w))
+        w.tick.connect(self._tick)
+        # worker 跑完(正常/取消)→ 释放:断信号 + 从孤儿表移除 + deleteLater。
+        # 不接 deleteLater 的话,被取消又被替换的 worker 会被 succeeded/failed/tick
+        # 三个 lambda 闭包(各持 _w=w)长期引用,连同其 _ticker 线程一起泄漏。
+        w.finished.connect(lambda _w=w: self._cleanup_worker(_w))
+        self._worker = w
+        w.start()
+
+    def _orphan_worker(self, w):
+        """把一个【已取消但还在跑】的 worker 移出主路径,挂进孤儿表保活到它自己退出。
+
+        必须保留一个 Python 引用(_orphans),否则 QThread 对象可能在仍运行时被 GC,
+        Qt 会报 'QThread: Destroyed while thread is still running' 甚至崩溃。
+        它退出时 finished→_cleanup_worker 会把它从 _orphans 摘掉并 deleteLater。
+        """
+        if w is None:
+            return
+        # 立即断开 tick:孤儿的 _ticker 线程会继续每秒 emit tick 打到 self._tick,
+        # 与新 worker 的 tick 交替打架,转圈读秒会在两者之间忽大忽小乱跳。
+        # succeeded/failed 不必在这里断——它们的回调有 _w 身份守卫(比对 self._worker),
+        # 孤儿的迟到结果会被守卫丢弃,不会串台;真正释放在 finished→_cleanup_worker。
+        try:
+            w.tick.disconnect(self._tick)
+        except (TypeError, RuntimeError):
+            pass
+        if not hasattr(self, "_orphans"):
+            self._orphans = []
+        if w not in self._orphans:
+            self._orphans.append(w)
+
+    def _cleanup_worker(self, w):
+        """worker finished 回调:断开它的信号、移出孤儿表、deleteLater 释放。"""
+        for sig in (w.succeeded, w.failed, w.tick):
+            try:
+                sig.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        if hasattr(self, "_orphans") and w in self._orphans:
+            self._orphans.remove(w)
+        if self._worker is w:
+            self._worker = None
+        try:
+            w.deleteLater()
+        except RuntimeError:
+            pass
 
     # ---------- 定时任务命令 ----------
     def _handle_schedule_command(self, text):
@@ -420,15 +539,22 @@ class ChatWindow(QWidget):
         m = re.search(r"删除任务\s*(\w+)", text) or re.search(r"删掉\s*(\w+)\s*任务", text)
         if m or "删除所有任务" in text or "清空任务" in text:
             if "所有" in text or "清空" in text:
-                for t in scheduler.load_tasks():
-                    scheduler.remove_task(t["id"])
-                self._say_local(text, "*把小本本擦干净* 所有定时任务都清掉啦~")
+                n = scheduler.remove_all_tasks()      # 锁内原子清空,不漏删并发新建
+                if n > 0:
+                    self._say_local(text, "*把小本本擦干净* 所有定时任务都清掉啦~")
+                elif n < 0:
+                    # 存盘失败:任务其实还在,别误报"清掉了/没有任务"
+                    self._say_local(text, "*急得冒汗* 呜…小本本擦不掉(存盘出错),任务还在,等会儿再试?")
+                else:
+                    self._say_local(text, "*翻翻小本本* 本来就没有任务呀~")
                 return True
             frag = m.group(1)
             for t in scheduler.load_tasks():
                 if t["id"].endswith(frag) or t["id"] == frag:
-                    scheduler.remove_task(t["id"])
-                    self._say_local(text, f"*划掉一行* 删掉啦:{scheduler.describe(t)}")
+                    if scheduler.remove_task(t["id"]):
+                        self._say_local(text, f"*划掉一行* 删掉啦:{scheduler.describe(t)}")
+                    else:
+                        self._say_local(text, "*挠头* 想删但小本本卡住了(存盘出错),这条没删掉,等会儿再试?")
                     return True
             self._say_local(text, "*挠头* 没找到这个任务诶… 说「我的任务」看看有哪些?")
             return True
@@ -440,21 +566,52 @@ class ChatWindow(QWidget):
         if scheduler.looks_like_schedule_strict(text):
             sched = scheduler.parse_schedule(text)
             if sched is not None:
-                self._save_schedule(text, sched)
+                # 内容为空(如"每天早上提醒我",剥掉时间词后没剩任务内容)→ 别建
+                # desc="提醒"、prompt 含时间词的空壳任务(到点冒"该「提醒」啦"用户
+                # 一头雾水)。交给 claude,它会用皮卡丘口吻反问"要提醒你做什么呀?"。
+                if not self._strip_time_words(text):
+                    return False
+                # reminder/action 拿不准(含执行动词的歧义,如"帮我提醒团队")
+                # → 不本地硬猜,交给 claude 结合语境判 mode 再建,避免误执行/误漏做。
+                mode = scheduler.fast_path_mode(text)
+                if mode is None:
+                    return False
+                self._save_schedule(text, sched, mode)
                 return True
-            # 极少数:strict 命中但 parse 没解析出 → 不强留,交给 claude
+            # strict 命中但 parse 没解析出 → 多半是越界时间(如"每天25点")。
+            # 不静默转给 claude(体验不一致:正常句秒建任务,这句却没反应),
+            # 本地给一句友好澄清,告诉用户时间不合法。
+            self._say_local(
+                text, "*挠头* 这个时间皮卡丘没看懂诶… 钟点要在 0~23 之间哦,"
+                "换个说法?比如「每天9点提醒我喝水」⚡")
+            return True
         return False
 
-    def _save_schedule(self, text, sched):
-        task = self._build_task(text, sched)
-        scheduler.add_task(task)
+    def _save_schedule(self, text, sched, mode):
+        task = self._build_task(text, sched, mode)
+        created = scheduler.add_task(task)
+        if created == "duplicate":
+            # 已有等价任务:别重复建,免得到点重复提醒。
+            self._say_local(text, f"*翻了翻小本本* 这个皮卡丘早就记着啦~「{scheduler.describe(task)}」😆")
+            return
+        if created == "save_failed":
+            # 存盘失败:别假报"记下啦",否则用户以为记住了、重启后任务消失。
+            self._say_local(text, "*急得冒汗* 呜…小本本写不进去(存盘出错了),这条没记成,等会儿再试试?")
+            return
         # 记进历史时带上 id 末4位,让后续"删掉它/改一下"发给 claude 时
         # 它能从历史里看到刚建了哪条任务、对应哪个 id,正确指代。
         pika = (f"*认真记到小本本上* 好嘞!记下啦:\n「{scheduler.describe(task)}」"
                 f"（id:{task['id'][-4:]}）\n到点皮卡丘会帮你搞定的!⚡")
         self._say_local(text, pika)
+        # 让桌宠本体也冒"已记下"气泡 + 放电,和走 claude+MCP 建任务的路径体验一致
+        # (那条路径靠 tool_events.jsonl 通知本体;快通道是本地直存,这里直接回调)。
+        if self.on_local_schedule is not None:
+            try:
+                self.on_local_schedule(task.get("desc", "提醒"))
+            except Exception:
+                pass
 
-    def _build_task(self, text, sched):
+    def _build_task(self, text, sched, mode):
         cleaned = self._strip_time_words(text)
         return {
             "id": scheduler._new_id(),
@@ -462,7 +619,9 @@ class ChatWindow(QWidget):
             # prompt 存去掉时间词的纯任务内容:到点执行时不会被"两分钟后"等
             # 残留时间词干扰,claude 才不会误以为还要等/只是记任务。
             "prompt": cleaned or text,
-            "mode": scheduler.task_mode(text),   # reminder=只提醒 / action=调claude执行
+            # mode 由 fast_path_mode 在调用方定好传入(reminder/action);
+            # 拿不准的(None)早已在 _handle_schedule_command 放行给 claude,不会到这。
+            "mode": mode,
             "enabled": True,
             **sched,
         }
@@ -473,11 +632,16 @@ class ChatWindow(QWidget):
         import re
         # 先把中文数字归一成阿拉伯数字,时间词正则才能命中"两分钟之后"等
         t = scheduler._normalize_cn_numbers(text)
+        # 时间点项尾部补 `半?`:否则"9点半"只剥掉"9点",残留的"半"会粘进
+        # desc/prompt(如"每天9点半提醒我运动"→"半运动"),气泡和发给 claude 的
+        # 指令都莫名带个"半"。"凌晨"也一并纳入早中晚词表。
         d = re.sub(r"(每天|每周[一二三四五六日天]?|每隔?\s*\d+\s*(秒|分钟|分|小时|个小时)|"
-                   r"\d+\s*[:点时]\s*\d*\s*分?|早上|中午|下午|晚上|傍晚|"
+                   r"\d+\s*[:点时]\s*\d*\s*分?半?|早上|中午|下午|晚上|傍晚|凌晨|"
                    r"\d+\s*(秒|分钟|分|小时|个小时)\s*[之以]?后|半小时后|"
                    r"提醒我|记得|准时|到点)", "", t).strip()
         d = d.lstrip("，,。.、 ")
+        # 兜底:清掉可能残留在开头的孤立"半"(如"点半"被拆后剩的"半")
+        d = re.sub(r"^半(?![小时点])", "", d).strip()
         # 去掉开头的称呼"皮卡丘,"
         d = re.sub(r"^皮卡丘[,，、\s]*", "", d).strip()
         return d
@@ -513,11 +677,22 @@ class ChatWindow(QWidget):
         if b is not None:
             b.setMinimumWidth(0)
             b.setMaximumWidth(360)
+            # 解除安抚换档时可能设过的固定高度,真回复才能按内容自由撑开
+            b.setMinimumHeight(0)
+            b.setMaximumHeight(16777215)
             b.setWordWrap(True)
             self._thinking_fixed = None
         self.thinking_ended.emit()          # 让桌宠本体退出思考态
 
-    def _reply(self, text):
+    def _reply(self, text, sender=None):
+        # 身份守卫:只接受【当前 worker】发来的回复。覆盖两种竞态:
+        # ① 用户取消后这条信号迟到(sender 已不是 self._worker);
+        # ② 取消 A 后立刻发 B,A 的迟到回复(sender 是 A,self._worker 是 B)。
+        # 两者都 → sender is not self._worker → 直接丢弃,不污染当前对话/历史。
+        if sender is not None and sender is not self._worker:
+            return
+        if self._worker is not None and self._worker.cancelled:
+            return
         if self._thinking is not None:
             self._release_thinking()
             self._set_html(self._thinking, text); self._thinking = None
@@ -527,14 +702,38 @@ class ChatWindow(QWidget):
         self._history.append(("皮卡丘", text))
         self._busy(False)
         QTimer.singleShot(30, self._scroll_bottom)
+        self._notify_if_hidden(ok=True)
 
-    def _error(self, msg):
+    def _error(self, msg, sender=None):
+        if sender is not None and sender is not self._worker:
+            return
+        if self._worker is not None and self._worker.cancelled:
+            return
         if self._thinking is not None:
             self._release_thinking()
             self._set_html(self._thinking, f"⚠️ {msg}"); self._thinking = None
         else:
             self._add("皮卡", f"⚠️ {msg}")
+        # 把失败这一轮也写进历史:否则用户接着说"再试一次/刚才那个"时,发给 claude
+        # 的最近 12 轮里没有这次提问的痕迹,claude 不知道"刚才"指什么。用占位回复
+        # 记下皮卡丘没答上来,保持多轮上下文连贯。
+        if self._pending_user:
+            self._history.append(("我", self._pending_user))
+            self._history.append(("皮卡丘", "(没能回应,出错了)"))
         self._busy(False)
+        self._notify_if_hidden(ok=False)
+
+    def _notify_if_hidden(self, ok):
+        """后台 claude 跑完时若聊天窗是关着的,让本体冒气泡提示用户回来看,
+        否则收了窗就不知道活干完没(claude 后台继续干是新设计:收窗不中断)。
+        """
+        if self.isVisible():
+            return
+        if self.on_background_done is not None:
+            try:
+                self.on_background_done(ok)
+            except Exception:
+                pass
 
     def _on_cancel(self):
         if self._worker and self._worker.isRunning():
@@ -546,11 +745,18 @@ class ChatWindow(QWidget):
 
     # ---------- 显示 ----------
     def show_near(self, pet_geo):
-        screen = self.screen().availableGeometry() if self.screen() else None
-        x = pet_geo.x() - self.width() - 4
+        from PyQt6.QtWidgets import QApplication
+        # 首次 show 前 self.screen() 可能为 None → 回退主屏,确保 clamp 一定生效,
+        # 否则聊天窗可能定位到屏幕外(尤其皮卡丘被拖到边角时)。
+        scr = self.screen() or QApplication.primaryScreen()
+        screen = scr.availableGeometry() if scr else None
+        x = pet_geo.x() - self.width() - 4              # 优先放皮卡丘左侧
         y = pet_geo.y() + pet_geo.height() // 2 - self.height() // 2
         if screen is not None:
             if x < screen.left():
+                x = pet_geo.right() + 4                 # 左侧放不下 → 试右侧
+            if x + self.width() > screen.right():
+                # 左右都放不下 → 皮卡丘正上方居中
                 x = pet_geo.x() + pet_geo.width() // 2 - self.width() // 2
                 y = pet_geo.y() - self.height() - 4
             x = max(screen.left() + 4, min(x, screen.right() - self.width() - 4))
@@ -560,5 +766,10 @@ class ChatWindow(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+        # 重开窗时若上次的 claude 还在后台跑(收窗没中断它):让桌宠本体重新进
+        # 思考态接续(hideEvent 时让它退出过),并滚到底看到那条还在转圈的气泡。
+        if self._worker is not None and self._worker.isRunning():
+            self.thinking_started.emit()
+            QTimer.singleShot(30, self._scroll_bottom)
         # 延迟聚焦输入框(立即 setFocus 在无边框 Tool 窗上会触发输入法噪音日志)
         QTimer.singleShot(120, self.input.setFocus)

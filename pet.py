@@ -72,6 +72,9 @@ def ensure_avatar():
 # ════════════════════════  桌宠窗口  ════════════════════════
 class PikachuPet(QWidget):
     PAD = 24  # 窗口内边距(给气泡/电花留空间)
+    # 顶部预留给气泡的高度:多行气泡(首次引导那条 3~4 行)约需 100px。
+    # 设为类属性,确保 paintEvent / _spawn_mood 任何时候取到的都一致。
+    BUBBLE_TOP_RESERVE = 120
 
     def __init__(self):
         super().__init__()
@@ -96,6 +99,10 @@ class PikachuPet(QWidget):
         self._particles = []        # D特效:心情图标粒子 [{x,y,vy,ch,life,max,color}]
         self._mood_prev_state = "idle"  # 上一帧状态(用于检测进入 happy/cheer/sad)
         self._last_interact = 0     # 最近一次互动时刻
+        # E2:定时 action 任务跑完时若聊天窗没开,claude 的实际执行结果先存这里,
+        # 等用户打开聊天窗再补写进去——否则只冒"✅完成"气泡、结果丢失,
+        # 用户永远不知道到底做了啥、做对没。[(desc, reply, ok)]
+        self._pending_results = []
         self._t = QElapsedTimer()
         self._t.start()
 
@@ -136,12 +143,19 @@ class PikachuPet(QWidget):
             | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
-        self._win_w = self._content_w + self.PAD * 2
-        self._win_h = self._content_h + self.PAD * 2 + 30  # 顶部给气泡
+        # 窗口宽至少要放得下气泡(BUBBLE_MAX_W + 左右各 4px),否则气泡比窗口宽、
+        # 右半被窗口边界裁掉。ASCII 画面本身较窄,这里按气泡需求取较大值。
+        self._win_w = max(self._content_w + self.PAD * 2, self.BUBBLE_MAX_W + 8)
+        # 顶部预留 BUBBLE_TOP_RESERVE 给气泡(原来只留 30px,长气泡上下被截断)
+        self._win_h = self._content_h + self.PAD * 2 + self.BUBBLE_TOP_RESERVE
         self.resize(int(self._win_w), int(self._win_h))
         sg = QApplication.primaryScreen().availableGeometry()
         self._screen = sg
-        self.move(sg.width() - self._win_w - 80, sg.height() - self._win_h - 80)
+        # 用 right()/bottom()(屏幕绝对坐标)而非 width()/height()(尺寸):
+        # availableGeometry 的原点可能非 (0,0)(顶部菜单栏让 y>0;多屏时主屏也可能
+        # 不在原点)。用尺寸当坐标会把窗口定位偏移,极端情况落到屏幕外。
+        self.move(int(sg.right() - self._win_w - 80),
+                  int(sg.bottom() - self._win_h - 80))
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -163,12 +177,13 @@ class PikachuPet(QWidget):
         frame = frames[self._frame % len(frames)]
         lines = frame.split("\n")
 
-        x0 = self.PAD
-        y0 = self.PAD + 30 + self._line_h  # baseline of first line
+        # 窗口可能因气泡需求被加宽,ASCII 内容在水平方向居中(否则偏左)
+        x0 = (self.width() - self._content_w) / 2
+        # 皮卡丘从顶部气泡预留区下方开始画,baseline 为首行底部
+        y0 = self.PAD + self.BUBBLE_TOP_RESERVE + self._line_h
         cw, lh = self._char_w, self._line_h
 
         YELLOW = QColor(255, 213, 30)
-        BLACK = QColor(40, 30, 0)
         GLOW = QColor(40, 30, 0, 150)
         RED = QColor(232, 60, 60)
 
@@ -179,13 +194,11 @@ class PikachuPet(QWidget):
                 if ch == " ":
                     continue
                 x = x0 + col_i * cw
-                # 颜色规则
-                if False:
-                    color = BLACK      # (此版不区分耳尖)
-                elif ch in "⚡":
-                    color = QColor(120, 200, 255)  # 电花偏蓝白
+                # 颜色规则:电花偏蓝白,脸颊红点,其余雷电黄
+                if ch in "⚡":
+                    color = QColor(120, 200, 255)
                 elif ch == "·":
-                    color = RED                     # 脸颊红点
+                    color = RED
                 else:
                     color = YELLOW
                 # 描边
@@ -251,15 +264,30 @@ class PikachuPet(QWidget):
             p.drawText(int(pt["x"]), int(pt["y"]), ch)
 
     # ---------- 行为状态机 ----------
+    def _chat_open(self):
+        """聊天窗当前是否打开着(可见)。"""
+        return self._chat is not None and self._chat.isVisible()
+
     def _pick_new_state(self, first=False):
         now = self._t.elapsed()
         idle_for = now - self._last_interact
+
+        # E4:聊天窗开着时,皮卡丘安静陪在原地——不走路、不跳、不睡觉、不打哈欠,
+        # 只在原地做小动作(眨眼/东张西望/吃东西/哼歌),免得你正打字它却走开、
+        # 或睡着了,和聊天窗脱节。聊天关掉后自然恢复自主玩耍。
+        if self._chat_open():
+            self._set_state(random.choice(("idle", "look", "eat", "sing")),
+                            random.randint(2200, 4200))
+            return
 
         # 长时间没互动 → 犯困:先打哈欠过渡,再睡觉
         if idle_for > config.SLEEP_AFTER_MS and self._state not in ("sleep", "yawn"):
             self._set_state("yawn", 2400)        # 哈欠完 → 下次 tick 进 sleep
             return
-        if self._state == "yawn" and idle_for > config.SLEEP_AFTER_MS:
+        # 只有【困倦 yawn】(本函数顶部那次,无 after_state)结束才进睡眠;
+        # 随机玩耍抽到的 yawn 设了 then=("idle",...),不该因恰好 idle 超时就睡。
+        if (self._state == "yawn" and idle_for > config.SLEEP_AFTER_MS
+                and self._after_state is None):
             self._set_state("sleep", config.SLEEP_DURATION_MS)
             return
 
@@ -285,7 +313,8 @@ class PikachuPet(QWidget):
         elif choice == "sing":
             self._set_state("sing", random.randint(3000, 5000))
         elif choice == "yawn":
-            self._set_state("yawn", random.randint(2000, 2800))
+            # 随机玩耍的哈欠:打完接 idle(用 then 链),区别于困倦 yawn(无 then→进睡眠)。
+            self._set_state("yawn", random.randint(2000, 2800), then=("idle", 1500))
         else:
             self._set_state("idle", random.randint(2000, 4000))
 
@@ -319,13 +348,21 @@ class PikachuPet(QWidget):
         now = self._t.elapsed()
         # 走路时移动窗口
         if self._state in ("walk_right", "walk_left"):
+            # 实时取当前屏幕几何:外接显示器拔插/分辨率变化后边界仍正确,
+            # 避免皮卡丘走出屏幕或卡在旧边界。取所在屏幕,取不到则回退主屏。
+            scr = self.screen() or QApplication.primaryScreen()
+            geo = scr.availableGeometry() if scr else self._screen
+            self._screen = geo
             dx = config.WALK_SPEED * self._walk_dir
             nx = self.x() + dx
-            # 撞到屏幕边缘就掉头
-            if nx < self._screen.left():
-                nx = self._screen.left(); self._flip_walk()
-            elif nx > self._screen.right() - self._win_w:
-                nx = self._screen.right() - self._win_w; self._flip_walk()
+            # 撞到屏幕边缘就掉头。用实时 self.width() 而非初始 self._win_w:
+            # 多屏/外接显示器 DPI 不同会让 Qt 重缩放窗口,实际宽变了,用旧值会
+            # 让皮卡丘走出屏幕或够不到最右端。
+            win_w = self.width()
+            if nx < geo.left():
+                nx = geo.left(); self._flip_walk()
+            elif nx > geo.right() - win_w:
+                nx = geo.right() - win_w; self._flip_walk()
             self.move(int(nx), self.y())
         # 跳跃时按抛物线上移再落回(0→顶→0)
         elif self._state == "jump":
@@ -359,6 +396,9 @@ class PikachuPet(QWidget):
         self._style_bubble(sticky=False)
         self.bubble.hide()
         self._bubble_sticky = False    # 当前气泡是否常驻(提醒类任务)
+        # sticky 提醒队列:同分钟多个定时任务到点时,不能让后一个气泡覆盖前一个
+        # (会丢失提醒)。改为排队:当前显示队首,点击确认弹出下一条,直到清空。
+        self._sticky_queue = []
         self._bubble_timer = QTimer(self)
         self._bubble_timer.setSingleShot(True)
         self._bubble_timer.timeout.connect(self.bubble.hide)
@@ -377,42 +417,132 @@ class PikachuPet(QWidget):
                 f"padding:6px 10px; font-size:12px; font-weight:bold; font-family:{config.FONT_STACK};")
 
     def show_bubble(self, text, sticky=False):
-        """sticky=True:常驻不自动消失,点击气泡才消失(用于定时提醒,点击=确认)。"""
+        """sticky=True:常驻不自动消失,点击气泡才消失(用于定时提醒,点击=确认)。
+
+        sticky 气泡之间不互相覆盖:已有未确认的 sticky 时,新 sticky 入队,
+        当前只显示队首并标注"还有 N 条"。非 sticky(走路逗趣气泡)也不会
+        顶掉未确认的 sticky 提醒——定时提醒优先级更高。
+        """
+        if sticky:
+            # W3 去重:同一条提醒(如每分钟的"该喝水啦")反复到点,不重复入队,
+            # 否则挂机一小时队列里全是同一句、要点几十次才清空。
+            # 正在显示的队首也算"已在队列",一并比对。
+            if text in self._sticky_queue:
+                self._refresh_sticky_text()
+                return
+            self._sticky_queue.append(text)
+            # W3 上限:超过上限丢最旧的未确认提醒,避免无限堆积。保留队首
+            # (用户正在看的那条)不被挤掉,从次旧的开始丢。
+            if len(self._sticky_queue) > config.STICKY_QUEUE_MAX:
+                # 丢掉索引 1(次旧),保住队首[0]
+                del self._sticky_queue[1]
+            # 当前没在显示 sticky → 立刻弹队首;否则只刷新角标,不覆盖正在看的那条
+            if not self._bubble_sticky:
+                self._show_next_sticky()
+            else:
+                self._refresh_sticky_text()
+            return
+        # 非 sticky:不打断未确认的 sticky 提醒(否则定时提醒会被走路气泡覆盖丢失)
+        if self._bubble_sticky:
+            return
+        self._render_bubble(text, sticky=False)
+        self._bubble_timer.start(config.BUBBLE_DURATION_MS)
+
+    BUBBLE_MAX_W = 260   # 气泡最大宽度(超出则换行;放宽些让长引导文案行数更少)
+
+    def _render_bubble(self, display, sticky):
+        """实际把文字画到气泡上(尺寸/定位/样式)。
+
+        关键:WordWrap 的 QLabel 在限宽后,adjustSize() 常按单行高算,导致多行
+        文本被裁(上下截断)。必须用 heightForWidth 显式把高度撑到换行后的真实
+        行数,长气泡(如首次引导那条)才不会被切掉头尾。
+        """
         self._bubble_sticky = sticky
         self._style_bubble(sticky)
-        display = (text + "  (点我确认 ✓)") if sticky else text
         self.bubble.setText(display)
+        # 先解除上一条可能残留的定宽/定高,再按内容自适应一次拿到自然宽度
+        self.bubble.setMinimumWidth(0)
+        self.bubble.setMaximumWidth(16777215)
+        self.bubble.setMinimumHeight(0)
+        self.bubble.setMaximumHeight(16777215)
         self.bubble.adjustSize()
-        if self.bubble.width() > 220:
-            self.bubble.setFixedWidth(220)
-            self.bubble.adjustSize()
-        else:
-            self.bubble.setMaximumWidth(16777215)  # 解除上次可能设的定宽
+        # 气泡宽度上限取 min(BUBBLE_MAX_W, 窗口宽-8),保证不超出窗口被裁
+        max_w = min(self.BUBBLE_MAX_W, self.width() - 8)
+        if self.bubble.width() > max_w:
+            # 超宽 → 限宽换行,并用 heightForWidth 算出换行后真正需要的高度
+            w = max_w
+            self.bubble.setFixedWidth(w)
+            h = self.bubble.heightForWidth(w)
+            if h > 0:
+                self.bubble.setFixedHeight(h)
+            else:
+                self.bubble.adjustSize()
         bx = (self.width() - self.bubble.width()) // 2
+        # 顶部对齐到 2px;高度由上面算准,_win_h 顶部预留已加大以容纳多行气泡
         self.bubble.move(max(2, bx), 2)
         self.bubble.show()
         self.bubble.raise_()
         self._bubble_timer.stop()
-        if not sticky:
-            self._bubble_timer.start(config.BUBBLE_DURATION_MS)
 
-    def _on_bubble_clicked(self):
-        # 点击气泡:常驻提醒被点 = 确认完成 → 消失
-        if self._bubble_sticky:
+    def _show_next_sticky(self):
+        """弹出 sticky 队列的队首;队列空则收起气泡。"""
+        if not self._sticky_queue:
             self.bubble.hide()
             self._bubble_sticky = False
+            return
+        self._render_bubble(self._sticky_text(), sticky=True)
+
+    def _refresh_sticky_text(self):
+        """队列变化时,刷新当前 sticky 气泡的"还有 N 条"角标。"""
+        if self._bubble_sticky:
+            self._render_bubble(self._sticky_text(), sticky=True)
+
+    def _sticky_text(self):
+        """队首文案 + (剩余条数)角标 + 确认提示。"""
+        text = self._sticky_queue[0]
+        more = len(self._sticky_queue) - 1
+        tail = f"(还有 {more} 条,点我看下一条 ✓)" if more > 0 else "(点我确认 ✓)"
+        return f"{text}  {tail}"
+
+    def _on_bubble_clicked(self):
+        # 点击 sticky 气泡 = 确认当前这条 → 弹出队列里的下一条(没有则收起)
+        if self._bubble_sticky:
+            if self._sticky_queue:
+                self._sticky_queue.pop(0)
+            self._show_next_sticky()
 
     # ---------- 托盘 ----------
-    def _init_tray(self):
-        icon = QIcon(config.HD_PATH) if os.path.exists(config.HD_PATH) else QIcon()
-        self.tray = QSystemTrayIcon(icon, self)
-        self.tray.setToolTip("皮卡丘桌宠 ⚡")
-        menu = QMenu()
+    def _build_menu(self):
+        """构建操作菜单(托盘和本体右键共用,保证总有退出入口)。"""
+        menu = QMenu(self)
         a1 = QAction("打开对话", self); a1.triggered.connect(self.open_chat); menu.addAction(a1)
         a2 = QAction("陪它玩(逗一下)", self); a2.triggered.connect(self._poke); menu.addAction(a2)
         menu.addSeparator()
         a3 = QAction("退出", self); a3.triggered.connect(QApplication.quit); menu.addAction(a3)
-        self.tray.setContextMenu(menu)
+        return menu
+
+    def _init_tray(self):
+        # E 兜底:本体右键菜单【始终】可用,不依赖系统托盘是否显示。
+        # 原因:setQuitOnLastWindowClosed(False) + Accessory 策略(无 Dock 图标),
+        # 退出全靠托盘菜单。但 QSystemTrayIcon 在某些 macOS 配置下(菜单栏图标被
+        # Bartender 等隐藏、隐私/权限限制)可能 show() 成功却看不见,用户就只能
+        # kill 进程。给本体加右键菜单作为永不失效的退出入口。
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        # 菜单只建【一次】并复用:每次右键都 _build_menu() 会新建 QMenu+3个 QAction,
+        # 它们都 parent=self,exec 后不会立即销毁,会作为子对象无限累积(右键几百次
+        # 后明显涨内存)。建一个常驻 _ctx_menu,每次 exec 它即可。
+        self._ctx_menu = self._build_menu()
+        self.customContextMenuRequested.connect(
+            lambda pos: self._ctx_menu.exec(self.mapToGlobal(pos)))
+
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            # 系统托盘不可用:不创建托盘,完全靠本体右键菜单退出。
+            self.tray = None
+            return
+        icon = QIcon(config.HD_PATH) if os.path.exists(config.HD_PATH) else QIcon()
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip("皮卡丘桌宠 ⚡(右键我也能退出)")
+        self.tray.setContextMenu(self._build_menu())
         self.tray.activated.connect(
             lambda r: self.open_chat() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray.show()
@@ -432,11 +562,31 @@ class PikachuPet(QWidget):
 
         # 工具事件:claude 通过 MCP 工具建任务时会往 tool_events.jsonl 追加一行,
         # 桌宠轮询它 → 冒"✅ 已记下"确认气泡。只处理启动后新增的行。
-        self._tool_evt_offset = os.path.getsize(config.TOOL_EVENTS_PATH) \
-            if os.path.exists(config.TOOL_EVENTS_PATH) else 0
+        # 记 (offset, inode):靠 inode 判断文件是否被重建,避免被截断到中间
+        # 状态时 seek(0) 把历史事件当新事件重读 → 重复冒气泡。
+        self._tool_evt_offset, self._tool_evt_inode = self._tool_evt_stat()
         self._tool_evt_timer = QTimer(self)
         self._tool_evt_timer.timeout.connect(self._check_tool_events)
         self._tool_evt_timer.start(1500)
+
+        # E1 首次引导:第一次运行时,延迟冒一个"双击我聊天"的常驻气泡,
+        # 让新用户发现核心功能(单击只逗一下,不开聊天,容易以为没反应)。
+        if not os.path.exists(config.FIRST_RUN_FLAG):
+            QTimer.singleShot(config.ONBOARD_DELAY_MS, self._maybe_onboard)
+
+    def _maybe_onboard(self):
+        """首次引导气泡(只弹一次,靠标记文件去重)。"""
+        if os.path.exists(config.FIRST_RUN_FLAG):
+            return
+        # 写标记:即便这次没看到,也不再反复弹。写失败不致命(大不了下次再弹)。
+        try:
+            with open(config.FIRST_RUN_FLAG, "w", encoding="utf-8") as f:
+                f.write("1")
+        except OSError:
+            pass
+        # 引导时本体开心放电一下,更显眼;sticky 气泡点击才消失,确保用户看到。
+        self._flash_state("happy", 2200)
+        self.show_bubble(config.ONBOARD_HINT, sticky=True)
 
     def _on_anim(self):
         self._frame += 1
@@ -472,14 +622,28 @@ class PikachuPet(QWidget):
 
     def _spawn_mood(self, ch, count, rising):
         """在皮卡丘头顶/周身生成 count 个 ch 粒子。rising=True 上浮,否则下落。"""
-        if len(self._particles) >= config.FX_MOOD_MAX:
+        # 裁剪到不超上限:旧版只在"已满"时整批跳过,但当前是 MAX-1、又要生成 6 个
+        # 时会一次性 append 全部 6 个 → 实际数量冲到 MAX+5。改为只补到上限为止。
+        room = config.FX_MOOD_MAX - len(self._particles)
+        if room <= 0:
             return
+        count = min(count, room)
         cx = self._win_w / 2
-        top = self.PAD + 30
+        # 角色身体的纵向范围:[body_top, body_top+content_h]。
+        body_top = self.PAD + self.BUBBLE_TOP_RESERVE
+        # 上浮粒子(✨/⚡)从角色【上半身】冒出:若像旧版从 body_top 起步,会立刻
+        # 升进顶部气泡保留区、被气泡控件遮住看不见。从身体 1/4~1/2 处起步,
+        # 让它们有一段在角色头顶上方的可见上升轨迹。下落粒子(💧)从身体上沿开始。
+        if rising:
+            y_lo = body_top + self._content_h * 0.25
+            y_hi = body_top + self._content_h * 0.5
+        else:
+            y_lo = body_top
+            y_hi = body_top + 20
         for _ in range(count):
             self._particles.append({
                 "x": cx + random.uniform(-self._content_w / 2, self._content_w / 2),
-                "y": top + random.uniform(0, 20),
+                "y": random.uniform(y_lo, y_hi),
                 "vx": random.uniform(-0.4, 0.4),
                 "vy": random.uniform(-1.6, -0.8) if rising else random.uniform(0.8, 1.6),
                 "ch": ch,
@@ -496,26 +660,105 @@ class PikachuPet(QWidget):
             return
         now = datetime.now()
         for task in tasks:
-            if scheduler.is_due(task, now, self._sched_last_fired):
-                self._sched_last_fired[task["id"]] = now.strftime("%Y%m%d%H%M")
-                scheduler.after_fire(task, tasks)   # once标记done/interval顺延
-                self._run_scheduled_task(task)
+            # 单条任务的处理整体包 try/except:某条任务字段损坏(外部编辑/旧版本
+            # 残留)导致 is_due/after_fire/dedup_key 抛异常时,只跳过这一条,绝不
+            # 让异常冒泡中断整个 for 循环(否则它后面的正常任务全被漏掉,且因定时
+            # 器每 20s 再跑又会再崩,永久卡住所有调度)。
+            try:
+                self._check_one_scheduled(task, now, tasks)
+            except Exception as exc:
+                print(f"[pet] 跳过一条出错的定时任务({task.get('id')}):{exc}")
+        return
+
+    def _check_one_scheduled(self, task, now, tasks):
+        """处理单条到点判断与触发(被 _check_scheduled 逐条包 try/except 调用)。"""
+        if not scheduler.is_due(task, now, self._sched_last_fired):
+            return
+        # W2 并发护栏:真正要起 claude 子进程的(执行类、且非降级的周期任务)
+        # 才占名额;名额满时【不消耗本次触发】(不写 stamp、不 after_fire),
+        # 让它保持 due,下一轮(20s 后)有空位再起 —— 避免任务被静默丢弃。
+        if self._will_spawn_worker(task) and \
+                self._alive_workers() >= config.MAX_CONCURRENT_SCHED_WORKERS:
+            return
+        # 去重键随 kind 变化:daily 按日期、weekly 按年+周、其余按分钟。
+        # 必须与 scheduler.is_due 内部用的键一致,否则持久化去重失效。
+        stamp = scheduler.dedup_key(task, now)
+        self._sched_last_fired[task["id"]] = stamp
+        # once标记done / interval顺延 / daily-weekly持久化stamp防重启重触发
+        persisted = scheduler.after_fire(task, tasks, stamp)
+        # H 加固:once + action(到点真执行危险操作)且 done 没落盘时,
+        # 【不执行】——宁可这次漏做,也不冒"重启后重复执行"的险(重复 git push
+        # /删文件代价高)。内存 _sched_last_fired 已记 stamp,本进程内不会重触发;
+        # 真正危险的是重启后盘上 done 缺失。reminder / 其他 kind 不受此限:
+        # 重复提醒无害,漏提醒反而更糟,照常触发。
+        if (not persisted and task.get("kind") == "once"
+                and task.get("mode") == "action"):
+            # 撤回内存 stamp,让它下一轮仍 due:期望届时磁盘恢复正常能写成 done
+            self._sched_last_fired.pop(task["id"], None)
+            self.show_bubble(
+                f"*挠头* 「{task.get('desc','任务')[:10]}」存档出错,"
+                "皮卡先不动手,等会儿再试~", sticky=True)
+            return
+        self._run_scheduled_task(task)
+
+    def _will_spawn_worker(self, task) -> bool:
+        """这个任务到点是否会真起一个 claude 子进程(用于并发名额判断)。
+
+        只有"执行类(action)"且有非空 prompt、且不是被降级的周期任务,才会起
+        worker。纯提醒、空 prompt 兜底、降级的 interval+action 都只冒气泡,不占名额。
+        """
+        if task.get("mode") != "action":
+            return False
+        if not (task.get("prompt") or "").strip():
+            return False
+        if (task.get("kind") == "interval"
+                and not config.ALLOW_INTERVAL_ACTION):
+            return False
+        return True
+
+    def _alive_workers(self):
+        """清理已结束的 worker,返回仍在跑的数量(用于并发上限判断)。"""
+        self._sched_workers = [w for w in self._sched_workers if w.isRunning()]
+        return len(self._sched_workers)
+
+    @staticmethod
+    def _tool_evt_stat():
+        """返回 (size, inode);文件不存在返回 (0, None)。"""
+        try:
+            st = os.stat(config.TOOL_EVENTS_PATH)
+            return st.st_size, st.st_ino
+        except OSError:
+            return 0, None
 
     def _check_tool_events(self):
         """读取 claude 通过 MCP 工具产生的新事件,冒确认气泡。"""
         path = config.TOOL_EVENTS_PATH
         try:
-            if not os.path.exists(path):
+            size, inode = self._tool_evt_stat()
+            if inode is None:
                 return
-            size = os.path.getsize(path)
-            if size < self._tool_evt_offset:
-                self._tool_evt_offset = 0      # 文件被清空/重建,从头读
+            # 文件被重建(inode 变了)或被清空/截断(size 变小)→ 从头读。
+            # 用 inode 而非仅靠 size,能可靠区分"截断重写"与"正常追加"。
+            if inode != self._tool_evt_inode or size < self._tool_evt_offset:
+                self._tool_evt_offset = 0
+                self._tool_evt_inode = inode
             if size == self._tool_evt_offset:
                 return
-            with open(path, encoding="utf-8") as f:
+            # 用二进制读,offset/size 都是字节单位,避免 text 模式下字符数与字节数
+            # 不一致(中文)造成 seek/offset 错位。
+            with open(path, "rb") as f:
                 f.seek(self._tool_evt_offset)
-                new_lines = f.readlines()
-                self._tool_evt_offset = f.tell()
+                chunk = f.read()
+            # 只消费到最后一个换行符为止:MCP 写一行时若被轮询撞上写到一半(没有
+            # 末尾 \n),旧版用 readlines+tell 会把这半行当完整行解析(失败丢弃),
+            # 且 offset 已推过它 → 下次不再读 → 该事件永久丢失。改为只在确实读到
+            # 完整行(有 \n)时推进 offset,半行留到下次它写完整了再读。
+            nl = chunk.rfind(b"\n")
+            if nl == -1:
+                return  # 还没有任何完整行,等下一轮
+            complete = chunk[:nl + 1]
+            self._tool_evt_offset += len(complete)
+            new_lines = complete.decode("utf-8", "replace").splitlines()
         except Exception:
             return
 
@@ -533,22 +776,58 @@ class PikachuPet(QWidget):
                 self._set_state("happy", 1800)
                 self.show_bubble(f"✅ 已记下「{desc[:14]}」", sticky=True)
 
+    def _flash_state(self, state, dur):
+        """到点时短暂切个情绪态;但聊天正在等 claude(思考态)时不打断它。
+
+        与 _poke 一致:思考中只冒气泡、不切动作态,否则本体跳去 happy 而聊天窗
+        还在转圈,二者不同步(W4)。
+        """
+        if self._thinking_active:
+            return
+        self._set_state(state, dur)
+
     def _run_scheduled_task(self, task):
         """到点了:提醒类→常驻气泡提醒(点击确认);执行类→调 claude 干活。"""
-        self._set_state("happy", 2200)
         desc = task.get("desc", "任务")
         mode = task.get("mode", "reminder")
+        kind = task.get("kind")
+
+        # W1 安全护栏:周期(interval)的"执行类"任务最危险——无人值守下会在 auto
+        # 权限里反复自动跑危险操作(git push、删文件…)。默认降级成"周期提醒",
+        # 让用户每次手动确认要不要做,而不是放它自动连环执行。
+        if (mode == "action" and kind == "interval"
+                and not config.ALLOW_INTERVAL_ACTION):
+            self._flash_state("happy", 2200)
+            self.show_bubble(
+                f"⏰ 又到「{desc[:14]}」时间啦~ 要做的话点我,在对话里说一声哦",
+                sticky=True)
+            return
 
         if mode == "reminder":
             # 纯提醒:冒一个常驻、醒目的气泡,点击才消失(=你确认了)
+            self._flash_state("happy", 2200)
             self.show_bubble(f"⚡ 该「{desc[:16]}」啦!", sticky=True)
             return
 
         # 执行类:调 claude 真去干活
-        self.show_bubble(f"⚡ 皮卡丘开工:{desc[:12]}")
         raw = task.get("prompt", "").strip()
+        # W6:任务没写要做什么(prompt 空),别冒"开工"后无下文,给一句兜底
         if not raw:
+            self._flash_state("sad", 1800)
+            self.show_bubble(f"*挠头* 「{desc[:12]}」要做啥呀?皮卡没记清…", sticky=True)
             return
+
+        # W2 资源护栏:并发名额已在 _check_scheduled 把关(满额则不消耗触发、
+        # 下一轮重试)。这里再做一次防御性兜底:万一被直接调用且已满,不超额起,
+        # 冒提示而非硬起一个超限子进程。
+        if self._alive_workers() >= config.MAX_CONCURRENT_SCHED_WORKERS:
+            self.show_bubble(f"⚡ 皮卡丘忙不过来,稍等下再做「{desc[:10]}」", sticky=True)
+            return
+
+        self.show_bubble(f"⚡ 皮卡丘开工:{desc[:12]}")
+        # W5:执行期间维持"think(挠头干活)"态,worker 完成才退出 ——
+        # 让用户看出后台真的在忙,而不是 happy 2.2s 后就回去随机玩耍。
+        self._flash_state("think", 600000)
         # 关键:到点 = 现在就执行,必须给 claude 明确的"立刻做"指令。
         # 否则原句里残留的时间词(如"两分钟之后")会让 claude 误以为还要等、
         # 或只是"记个定时任务",而不真去干活。
@@ -568,27 +847,50 @@ class PikachuPet(QWidget):
         worker.start()
 
     def _on_sched_done(self, task, reply):
-        self._set_state("cheer", 2600)   # 任务成功:大放电庆祝
-        # 完成也用常驻气泡,点击确认才消失(免得你没看到)
-        self.show_bubble(f"✅ 完成「{task.get('desc','任务')[:14]}」", sticky=True)
+        self._flash_state("cheer", 2600)   # 任务成功:大放电庆祝(思考中不打断)
+        desc = task.get("desc", "任务")
+        # 完成也用常驻气泡,点击确认才消失(免得你没看到)。提示可去聊天窗看详情。
+        self.show_bubble(f"✅ 完成「{desc[:14]}」(双击我看皮卡丘做了啥)", sticky=True)
+        full = f"*得意地翘尾巴* 定时任务「{desc}」搞定啦!⚡\n{reply}"
+        # E2:聊天窗开着直接写入;没开则存起来,等用户打开聊天窗补看,不丢结果。
         if self._chat is not None and self._chat.isVisible():
-            self._chat._add("皮卡", f"*得意地翘尾巴* 定时任务「{task.get('desc','')}」搞定啦!⚡\n{reply}")
+            self._chat._add("皮卡", full)
+        else:
+            self._stash_result(full)
 
     def _on_sched_fail(self, task, err):
-        self._set_state("sad", 2600)     # 任务失败:耷拉耳朵沮丧
-        self.show_bubble(f"⚠️ 没做成「{task.get('desc','')[:10]}」", sticky=True)
+        self._flash_state("sad", 2600)     # 任务失败:耷拉耳朵沮丧(思考中不打断)
+        desc = task.get("desc", "")
+        self.show_bubble(f"⚠️ 没做成「{desc[:10]}」(双击我看详情)", sticky=True)
+        full = f"*耷拉耳朵* 「{desc}」没做成…{err[:80]}"
         if self._chat is not None and self._chat.isVisible():
-            self._chat._add("皮卡", f"*耷拉耳朵* 「{task.get('desc','')}」没做成…{err[:80]}")
+            self._chat._add("皮卡", full)
+        else:
+            self._stash_result(full)
+
+    def _stash_result(self, text):
+        """暂存一条定时任务结果,等聊天窗打开时补写。上限 10 条,超出丢最旧。"""
+        self._pending_results.append(text)
+        if len(self._pending_results) > 10:
+            del self._pending_results[0]
 
     # ---------- 互动 ----------
     def _poke(self):
         self._last_interact = self._t.elapsed()
         self.show_bubble(random.choice(config.POKE_REACTIONS))
+        # 思考中(等 claude 回复)时只冒气泡,不切动作态,
+        # 否则会打断 think 动画,本体与聊天窗"正在想"不同步。
+        if self._thinking_active:
+            return
         # 先吓一跳缩一下(surprise),再开心放电(happy)
         self._set_state("surprise", 500, then=("happy", 1400))
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # 第二次 press 来了即停掉待执行的单击 timer:双击序列的第二击一按下
+            # 就已知是双击意图,不必等 mouseDoubleClickEvent 才停。否则高负载下
+            # 第一个 timer 可能在第二次 press 前就到期,单击气泡与双击开窗同触发。
+            self._click_timer.stop()
             self._press_pos = event.globalPosition().toPoint()
             self._drag_offset = self._press_pos - self.frameGeometry().topLeft()
             self._moved = False
@@ -643,12 +945,47 @@ class PikachuPet(QWidget):
 
     def open_chat(self):
         self._last_interact = self._t.elapsed()
+        # E4:打开聊天前若本体正走路/跳跃,先立刻停下归位(跳跃落地),再切安静态。
+        # 否则:① 走到一半的位置去定位聊天窗会偏;② 要等当前 walk 到期(最长5s)
+        # 本体才停,这期间它还在移动、和刚弹出的聊天窗脱节。
+        if self._state == "jump":
+            self.move(self.x(), self._jump_base_y)
+        if self._state in ("walk_right", "walk_left", "jump", "sleep", "yawn"):
+            self._set_state("look", 2600)   # 抬头看向你,安静下来
         if self._chat is None:
             self._chat = ChatWindow()
             # 聊天等 claude 回复时,桌宠本体也进/退思考态呼应
             self._chat.thinking_started.connect(self._enter_thinking)
             self._chat.thinking_ended.connect(self._exit_thinking)
+            # 快通道(本地直存)建任务时,本体也冒"已记下"气泡,
+            # 和走 claude+MCP(tool_events.jsonl)的路径体验一致。
+            self._chat.on_local_schedule = self._on_local_schedule
+            # 收窗不中断 claude:后台跑完时若窗关着,本体冒气泡提醒回来看。
+            self._chat.on_background_done = self._on_chat_background_done
         self._chat.show_near(self.frameGeometry())
+        # E2:把聊天窗没开时积压的定时任务结果补写进去,让用户看到到底做了啥。
+        if self._pending_results:
+            pending, self._pending_results = self._pending_results, []
+            for text in pending:
+                self._chat._add("皮卡", text)
+
+    def _on_local_schedule(self, desc):
+        """聊天窗快通道本地建任务后回调:本体放电 + 冒确认气泡。"""
+        self._set_state("happy", 1800)
+        self.show_bubble(f"✅ 已记下「{str(desc)[:14]}」", sticky=True)
+
+    def _on_chat_background_done(self, ok):
+        """收起聊天窗后,后台 claude 跑完的回调:冒常驻气泡提醒回来看回复。
+
+        收窗不再中断 claude(它后台继续干),所以干完得有个提示,否则用户
+        收了窗就不知道活干完没。点击/双击本体即可重开窗看完整回复。
+        """
+        if ok:
+            self._flash_state("cheer", 2400)
+            self.show_bubble("💡 皮卡丘想好啦!双击我看回复~", sticky=True)
+        else:
+            self._flash_state("sad", 2000)
+            self.show_bubble("⚠️ 皮卡丘卡住了…双击我看看", sticky=True)
 
     # ---------- 情境:思考态 ----------
     def _enter_thinking(self):
@@ -657,10 +994,71 @@ class PikachuPet(QWidget):
         self._thinking_active = True
 
     def _exit_thinking(self):
-        """claude 回复完:退出思考态,回到自主玩耍。"""
+        """claude 回复完:退出思考态。
+
+        但若此刻还有定时 action worker 在后台跑(聊天期间到点的任务),不要直接
+        回玩耍——本体接续维持 think 态,让用户看出后台还在忙(D 修复:否则聊天
+        一结束本体就切 idle,定时任务在跑却毫无视觉指示)。
+        """
         self._thinking_active = False
+        if self._alive_workers() > 0:
+            # 后台定时任务仍在跑 → 接续思考态(它完成时 _on_sched_done 会收尾)
+            self._set_state("think", 600000)
+            return
         if self._state == "think":
             self._set_state("idle", 1500)   # 短暂 idle 后自然进入随机玩耍
+
+    # ---------- 退出清理 ----------
+    def shutdown(self):
+        """退出前 cancel + join 所有在跑的 ClaudeWorker(QThread)。
+
+        否则进程退出时 QThread 仍在运行,Qt 会报
+        「QThread: Destroyed while thread is still running」甚至 abort,
+        且底层 claude 子进程会变成孤儿。cancel 会 kill 子进程,wait 等线程收尾。
+        """
+        workers = list(self._sched_workers)
+        if self._chat is not None:
+            if self._chat._worker is not None:
+                workers.append(self._chat._worker)
+            # 取消后被孤儿化、仍在跑的 chat worker 也要 join,否则退出时它仍运行 →
+            # 「QThread: Destroyed while thread is still running」+ claude 子进程变孤儿。
+            workers += list(getattr(self._chat, "_orphans", []))
+        # 去重(同一 worker 可能既是 _worker 又在某个表里),保持顺序
+        seen = set()
+        workers = [w for w in workers if not (id(w) in seen or seen.add(id(w)))]
+        for w in workers:
+            try:
+                # I 加固:先断开所有信号再 wait。QThread.wait 会 pump 事件循环,
+                # 期间 worker 残留的 succeeded/failed/finished 回调可能被派发到
+                # 正在析构的窗口(_reply 访问已销毁的 _thinking、_on_sched_done
+                # 写已关闭的聊天窗)→ use-after-free / 崩溃。退出阶段这些回调毫无
+                # 意义,统一断开。disconnect 无连接时会抛 TypeError,逐个 try 吞掉。
+                # finished 也要断:它连了 _sched_workers.remove,wait() 返回后
+                # 线程收尾阶段若仍发 finished,会访问可能正在析构的 self,
+                # 造成 use-after-free。退出阶段这些回调都没意义,一并断开。
+                for sig in (w.succeeded, w.failed, w.tick, w.finished):
+                    try:
+                        sig.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+                if w.isRunning():
+                    w.cancel()
+            except Exception:
+                pass
+        for w in workers:
+            try:
+                # cancel 已置位 → ask_pikachu 很快 kill 子进程返回;给 5s 上限兜底
+                w.wait(5000)
+            except Exception:
+                pass
+        # 状态重置:杀残留 claude/MCP 进程组 + 删运行时垃圾(锁/tmp/mcp_config/
+        # 事件流水/pid登记)。保留用户数据(定时任务、引导标记)。与看门狗共用
+        # 同一幂等清理,双方各跑一次也无害。
+        try:
+            import cleanup
+            cleanup.reset_system_state()
+        except Exception:
+            pass
 
 
 def _filter_macos_noise():
@@ -689,12 +1087,63 @@ def _filter_macos_noise():
 
 def main():
     _filter_macos_noise()
+
+    # 启动看门狗(最先做,趁还没起任何子进程/没建任何状态)。它通过管道 EOF
+    # 感知主进程死亡——包括被 kill -9 这种 shutdown 跑不到的情况——然后兜底
+    # 清理 claude/MCP 残留进程与垃圾文件。_wd_fd 必须【全程持有不 close】,
+    # 否则看门狗会误判主进程已死而提前清理。绑到 app 上防止被 GC。
+    import watchdog
+    _wd_fd = watchdog.spawn_watchdog()
+    # 把裸写端 fd 包成文件对象:① 防 fd 号被后续 open 意外复用(裸 int 无保护,
+    # 若别处 close 了同号 fd 再 open,会悄无声息触发看门狗);② 由对象生命周期
+    # 统一管理。closefd=True 让对象销毁时关闭底层 fd。绑到 app 上保活(见下)。
+    _wd_keepalive = None
+    if _wd_fd is not None:
+        try:
+            _wd_keepalive = os.fdopen(_wd_fd, "wb", buffering=0)
+        except OSError:
+            _wd_keepalive = None
+
+    # 启动即自愈:清掉上次会话(尤其上次被 kill -9、看门狗也异常没跑成)残留的
+    # 锁/tmp/旧 pid 登记,避免脏锁让本次任务读写卡住。只删垃圾,不杀进程
+    # (上次的 pid 登记此刻已无意义,且可能 PID 复用,不能照杀)。
+    try:
+        import cleanup
+        cleanup.remove_garbage_files()
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    # 持有写端文件对象,生命周期 = app。绝不在主进程存活期间 close 它,
+    # 否则看门狗会立刻误判主进程已死而提前清理。
+    app._wd_keepalive = _wd_keepalive
     if sys.platform == "darwin":
         macos_window.setup_app_policy()
-    ensure_avatar()
+    # 头像下载放后台线程:网络差时 curl(60s)+urllib(60s)串行最长阻塞 120s,
+    # 同步调用会让启动白屏。异步下载,皮卡丘本体立刻显示;头像只用于聊天窗标题/
+    # 托盘图标,_init_tray 已做 os.path.exists 判断,下载未完成也不影响功能。
+    import threading
+    threading.Thread(target=ensure_avatar, daemon=True).start()
     pet = PikachuPet()
+    # 退出前清理在跑的 claude 线程/子进程,避免 QThread 崩溃与孤儿进程
+    app.aboutToQuit.connect(pet.shutdown)
+
+    # 捕获 kill(SIGTERM)/ Ctrl-C(SIGINT):转成 Qt 的优雅退出(→aboutToQuit
+    # →shutdown→清理)。SIGKILL(kill -9)无法捕获,由看门狗兜底。
+    import signal as _signal
+
+    def _graceful(signum, frame):
+        app.quit()
+
+    _signal.signal(_signal.SIGTERM, _graceful)
+    _signal.signal(_signal.SIGINT, _graceful)
+    # Qt 阻塞在 C++ 事件循环时,Python 信号处理器不会被及时调用。用一个空转的
+    # QTimer 定期把控制权交回解释器,让上面的信号处理函数有机会执行。
+    _sig_timer = QTimer()
+    _sig_timer.timeout.connect(lambda: None)
+    _sig_timer.start(300)
+
     pet.show()
     sys.exit(app.exec())
 

@@ -11,15 +11,68 @@
 """
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import threading
+import time
 
 import config
 
 
 class ClaudeError(Exception):
     """claude 调用失败时抛出,聊天窗据此显示友好兜底文案。"""
+
+
+def _register_proc(proc: subprocess.Popen):
+    """把 claude 子进程的 pid 登记给退出清理/看门狗(失败不致命)。"""
+    try:
+        import cleanup
+        cleanup.register_pid(proc.pid)
+    except Exception:
+        pass
+
+
+def _deregister_proc(proc: subprocess.Popen):
+    """claude 子进程结束后从登记移除,防止其 pid 被系统复用后被误杀。"""
+    try:
+        import cleanup
+        cleanup.deregister_pid(proc.pid)
+    except Exception:
+        pass
+
+
+def _kill_proc_tree(proc: subprocess.Popen):
+    """杀掉 proc 及其整个进程组(含 claude 拉起的 MCP 孙进程)。
+
+    为什么不能只 proc.kill():claude 会通过 --mcp-config 拉起 pika_mcp.py 子进程。
+    只 kill claude 父进程,MCP 孙进程会变孤儿,且它可能仍持有 stdout/stderr 管道
+    写端的副本 → 父进程的 communicate() 永远等不到 EOF、_reader 线程永久阻塞泄漏
+    (fd + 线程)。配合 Popen(start_new_session=True) 把整组进程放进独立会话,
+    这里用 killpg 一次性全杀。
+    """
+    # start_new_session=True 使子进程自成进程组 leader,pgid == pid。直接对 pid
+    # 发 killpg,不绕 os.getpgid——后者对刚退出/僵尸进程可能成功返回但语义不稳,
+    # 且多一次系统调用多一个失败点。pgid==pid 是 Popen 时就确定的不变式。
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        # 进程已退出或拿不到进程组,退化为直接 kill 父进程
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    # 关键(F 修复):主动关闭管道读端,强制 communicate() 拿到 EOF 立刻返回。
+    # 否则——killpg 回退到只 kill 父进程时,claude 拉起的 MCP 孙进程仍存活并
+    # 持有 stdout/stderr 写端副本,communicate() 永远等不到 EOF → _reader daemon
+    # 线程永久阻塞、持有 fd 不释放。高频取消会累积僵线程,耗尽 fd 上限(macOS 默认 256)。
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 def _ensure_mcp_config() -> str | None:
@@ -37,8 +90,14 @@ def _ensure_mcp_config() -> str | None:
                 }
             }
         }
-        with open(config.MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
+        # 原子写:两条消息几乎同时发出时会有两个线程同时进来写同一文件,直接
+        # open("w") 会各自截断,内容可能交错成损坏 JSON → claude 读不了 → MCP
+        # 工具整体降级、定时任务功能失效。先写带 pid 的临时文件再 os.replace
+        # (同目录内原子),读方永远看到完整的旧版或完整的新版。
+        tmp = f"{config.MCP_CONFIG_PATH}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, config.MCP_CONFIG_PATH)
         return config.MCP_CONFIG_PATH
     except Exception:
         return None
@@ -129,34 +188,53 @@ def ask_pikachu(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # 独立会话/进程组:取消或超时时可用 killpg 连同 MCP 孙进程一起杀干净
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         raise ClaudeError(
             f"找不到 `{config.CLAUDE_BIN}` 命令,确认 Claude Code 已安装并在 PATH 中。"
         ) from exc
 
+    # 登记本子进程的 pgid(==pid,因 start_new_session=True),供退出清理/看门狗
+    # 在主进程死后 killpg 兜底,避免 kill -9 主进程时 claude/MCP 变孤儿。
+    _register_proc(proc)
+
     done = threading.Event()
     holder: dict[str, str] = {}
 
     def _reader():
-        out, err = proc.communicate()
-        holder["out"], holder["err"] = out, err
-        done.set()
+        # try/finally:communicate() 可能抛(如管道被 _kill_proc_tree 提前 close
+        # 后再读)。若不兜底,_deregister_proc 漏调(stale pid 残留→PID 复用误杀)、
+        # done.set() 漏调(主线程在 done.wait(3) 上白等满 3 秒才超时返回)。
+        try:
+            out, err = proc.communicate()
+            holder["out"], holder["err"] = out, err
+        except Exception:
+            holder.setdefault("out", "")
+            holder.setdefault("err", "")
+        finally:
+            # communicate 返回 = 子进程已退出(或已被杀)→ 从登记移除,防 pid 复用误杀
+            _deregister_proc(proc)
+            done.set()
 
     threading.Thread(target=_reader, daemon=True).start()
 
-    waited = 0.0
+    # 用单调时钟算 deadline,而非累加 step:系统繁忙时 done.wait(step) 实际阻塞
+    # 可能远超 step,若按 waited+=step 计数会严重低估真实耗时,导致硬超时翻倍。
+    deadline = time.monotonic() + config.CLAUDE_TIMEOUT_SEC
     step = 0.3
-    while waited < config.CLAUDE_TIMEOUT_SEC:
+    timed_out = True
+    while time.monotonic() < deadline:
         if cancel_event is not None and cancel_event.is_set():
-            proc.kill()
+            _kill_proc_tree(proc)
             done.wait(timeout=3)
             raise ClaudeError("已取消~")
         if done.wait(timeout=step):
+            timed_out = False
             break
-        waited += step
-    else:
-        proc.kill()
+    if timed_out:
+        _kill_proc_tree(proc)
         done.wait(timeout=3)
         raise ClaudeError(
             f"皮卡丘想了太久(超过 {config.CLAUDE_TIMEOUT_SEC} 秒)…可以让它做小一点的任务。"
@@ -200,29 +278,39 @@ def ask_raw(prompt: str, *, timeout_sec: int = 45,
         proc = subprocess.Popen(
             cmd, cwd=config.CLAUDE_WORKDIR, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         raise ClaudeError("找不到 claude 命令") from exc
+
+    _register_proc(proc)
 
     done = threading.Event()
     holder: dict[str, str] = {}
 
     def _reader():
-        out, err = proc.communicate()
-        holder["out"], holder["err"] = out, err
-        done.set()
+        try:
+            out, err = proc.communicate()
+            holder["out"], holder["err"] = out, err
+        except Exception:
+            holder.setdefault("out", "")
+            holder.setdefault("err", "")
+        finally:
+            _deregister_proc(proc)
+            done.set()
 
     threading.Thread(target=_reader, daemon=True).start()
-    waited = 0.0
-    while waited < timeout_sec:
+    deadline = time.monotonic() + timeout_sec
+    timed_out = True
+    while time.monotonic() < deadline:
         if cancel_event is not None and cancel_event.is_set():
-            proc.kill(); done.wait(timeout=3)
+            _kill_proc_tree(proc); done.wait(timeout=3)
             raise ClaudeError("已取消")
         if done.wait(timeout=0.3):
+            timed_out = False
             break
-        waited += 0.3
-    else:
-        proc.kill(); done.wait(timeout=3)
+    if timed_out:
+        _kill_proc_tree(proc); done.wait(timeout=3)
         raise ClaudeError("解析超时")
 
     stdout = holder.get("out", "") or ""

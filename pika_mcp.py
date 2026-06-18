@@ -80,26 +80,46 @@ def schedule_task(
     task = {
         "id": scheduler._new_id(),
         "desc": (desc or "提醒").strip()[:40],
-        "prompt": desc,        # action 模式到点会把它发给 claude 执行
+        # action 模式到点会把它发给 claude 执行;desc 可能是 None(模型传 null),
+        # 直接存 None 会让到点时 (prompt or "").strip() 为空 → 静默放弃执行。
+        "prompt": (desc or "").strip(),
         "mode": mode if mode in ("reminder", "action") else "reminder",
         "enabled": True,
         "kind": kind,
     }
     if kind == "daily":
+        if not (0 <= int(hour) <= 23 and 0 <= int(minute) <= 59):
+            return "ERROR: hour 必须 0-23、minute 必须 0-59。"
         task["hour"] = int(hour); task["minute"] = int(minute)
     elif kind == "weekly":
+        # 校验越界:weekday 越界会让 describe 崩溃(IndexError)或任务永不触发;
+        # hour/minute 越界则静默永不触发。一律拒绝并提示 claude 改正。
+        if not (0 <= int(weekday) <= 6):
+            return "ERROR: weekday 必须 0-6(0=周一,6=周日)。"
+        if not (0 <= int(hour) <= 23 and 0 <= int(minute) <= 59):
+            return "ERROR: hour 必须 0-23、minute 必须 0-59。"
         task["weekday"] = int(weekday)
         task["hour"] = int(hour); task["minute"] = int(minute)
     elif kind == "once":
+        if int(after_sec) <= 0:
+            return "ERROR: after_sec 必须 > 0(多少秒后触发)。"
         task["fire_at"] = now + int(after_sec)
     elif kind == "interval":
+        if int(every_sec) <= 0:
+            return "ERROR: every_sec 必须 > 0(每隔多少秒)。"
         task["every_sec"] = int(every_sec)
         task["next_at"] = now + int(every_sec)
     else:
         return f"ERROR: 未知的 kind「{kind}」,必须是 daily/weekly/once/interval。"
 
-    scheduler.add_task(task)
+    created = scheduler.add_task(task)
     human = scheduler.describe(task)
+    if created == "duplicate":
+        # 已有等价的未触发任务:不重复创建,也不冒"已记下"气泡。
+        return f"已存在相同的定时任务,无需重复创建:{human}"
+    if created == "save_failed":
+        # 存盘失败:如实告诉 claude 没记成,别让它对用户假报成功。
+        return "ERROR: 任务保存到磁盘失败(可能磁盘满或权限问题),没有创建成功,请稍后重试。"
     _emit_event("schedule", task["desc"])
     return f"已创建定时任务:{human}"
 
@@ -136,15 +156,19 @@ def delete_task(id_fragment: str) -> str:
             传 "all" 或 "全部" 删除所有任务。
     """
     frag = (id_fragment or "").strip()
-    tasks = scheduler.load_tasks()
     if frag in ("all", "全部", "所有"):
-        for t in tasks:
-            scheduler.remove_task(t["id"])
-        return f"已删除全部 {len(tasks)} 个任务。"
+        n = scheduler.remove_all_tasks()      # 锁内原子清空,不漏删并发新建
+        if n > 0:
+            return f"已删除全部 {n} 个任务。"
+        if n < 0:
+            return "ERROR: 清空任务时保存磁盘失败,任务可能还在,请稍后重试。"
+        return "当前没有任务可删除。"
+    tasks = scheduler.load_tasks()
     for t in tasks:
         if t["id"] == frag or t["id"].endswith(frag):
-            scheduler.remove_task(t["id"])
-            return f"已删除任务:{scheduler.describe(t)}"
+            if scheduler.remove_task(t["id"]):
+                return f"已删除任务:{scheduler.describe(t)}"
+            return "ERROR: 删除时保存磁盘失败,任务可能还在,请稍后重试。"
     return f"没找到匹配「{frag}」的任务。"
 
 

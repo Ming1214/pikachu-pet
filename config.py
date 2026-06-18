@@ -121,7 +121,10 @@ FONT_STACK = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif'
 # ─────────────────────────────  Claude CLI 集成  ─────────────────────────────
 CLAUDE_BIN = "claude"
 CLAUDE_WORKDIR = os.path.expanduser("~/Desktop/Claude-Code")
-CLAUDE_TIMEOUT_SEC = 300
+# 硬超时上限(最终兜底)。原 300s(5 分钟)对闲聊卡住太久——一句问候不该让用户
+# 干等 5 分钟才报错。降到 180s:够真实写文件/跑命令的任务用,又不至于卡死太久。
+# 在此之前 20s/45s 已有分级安抚提示,告诉用户可点 ✕ 主动停。
+CLAUDE_TIMEOUT_SEC = 180
 CLAUDE_MULTI_TURN = True
 # 权限模式:auto = 智能判断安全性(安全放行/危险拦截),适合非交互桌宠。
 # 可选 "bypassPermissions"(全放行)/"acceptEdits"(只接受编辑,会卡)。
@@ -138,6 +141,56 @@ MCP_ALLOWED_TOOLS = [
 ]
 # 工具事件文件:claude 通过工具建任务时写一行,桌宠轮询它来冒确认气泡
 TOOL_EVENTS_PATH = os.path.join(BASE_DIR, "tool_events.jsonl")
+
+# ── 退出清理 / 看门狗(状态重置)──
+# 登记本会话起过的 claude 子进程 pgid(每行一个 int)。主进程起 claude 时追加;
+# 退出清理(主进程 shutdown 或看门狗)读它逐个 killpg,连 MCP 孙进程一起杀干净。
+# 因 claude 用 start_new_session=True,其 pgid == pid,登记 pid 即登记整组。
+WATCHDOG_PIDS_PATH = os.path.join(BASE_DIR, ".watchdog_pids")
+# 退出清理时要删除的"运行时垃圾"文件(锁/自动生成配置/事件流水/tmp/引导外的临时态)。
+# 注意:不含 scheduled_tasks.json(用户的定时任务)和 .onboarded(引导标记)——
+# 那是用户数据,退出时【保留】。
+def _cleanup_garbage_paths():
+    import glob
+    # 注意:【不删】scheduled_tasks.json.lock。flock 锁绑定的是文件描述符,删掉
+    # 锁文件的路径不会解除已持锁进程的锁,反而会让后续 open(LOCK_PATH,"w") 创建
+    # 一个新 inode 的锁文件——与仍持旧 inode 锁的进程(如还没退干净的 MCP 孙进程)
+    # 各锁各的、互相看不见,flock 协议失效 → 两进程同时 read-modify-write
+    # scheduled_tasks.json → 后写者覆盖先写者 → 用户定时任务静默丢失。
+    # stale lock 文件本身无害(无持有者时 open 重用即可),留着不删才是安全的。
+    paths = [
+        MCP_CONFIG_PATH,
+        TOOL_EVENTS_PATH,
+        WATCHDOG_PIDS_PATH,
+    ]
+    # 原子写残留的临时文件 scheduled_tasks.json.<pid>.tmp:只清【自己这个进程】
+    # 留下的(用本进程 pid 精确匹配)。旧版用通配 *.tmp 会连带删掉【另一个桌宠
+    # 实例正在写】的临时文件 → 那个实例的 os.replace 失败、那次保存丢失。
+    # 同理 mcp_config 的原子写临时文件也只清自己 pid 的。
+    own = os.getpid()
+    paths += glob.glob(os.path.join(BASE_DIR, f"scheduled_tasks.json.{own}.tmp"))
+    paths += glob.glob(os.path.join(BASE_DIR, f"mcp_config.json.{own}.tmp"))
+    return paths
+
+# ── 首次引导(E1)──
+# 桌宠核心功能是"双击聊天",但单击只逗一下,新用户可能发现不了能聊天。
+# 首次启动延迟冒一个常驻引导气泡告诉用户双击聊天;靠这个标记文件只弹一次。
+FIRST_RUN_FLAG = os.path.join(BASE_DIR, ".onboarded")
+ONBOARD_DELAY_MS = 4000   # 启动后多久冒引导气泡(让本体先稳定显示出来)
+ONBOARD_HINT = "*蹦到你面前* 嗨~ 双击我就能和我聊天、让我帮你干活哦!⚡"
+
+# ── 定时任务安全/资源护栏(第五轮加固)──
+# 同时在跑的"执行类(action)"claude 子进程上限:多个 action 任务同分钟到点时
+# 不一次性全 spawn(每个 claude 内存/CPU 不小,易拖垮机器或撞 API 限流),
+# 超限的任务排队,等有空位的下一轮调度(每 20s)再起。
+MAX_CONCURRENT_SCHED_WORKERS = 2
+# sticky 提醒队列上限:interval 提醒长期没人确认会无限堆积,超过则丢最旧的,
+# 只保留最近 N 条(同一文案还会先去重,见 show_bubble)。
+STICKY_QUEUE_MAX = 8
+# action + interval(周期自动执行)风险最高:无人值守下在 auto 权限里反复跑
+# 危险操作(git push、删文件…)。默认不让它自动执行,而是到点提醒用户手动确认,
+# 把"周期自动干活"降级为"周期提醒"。设 True 才允许周期任务真的自动执行。
+ALLOW_INTERVAL_ACTION = False
 
 # 皮卡丘人设:像一只真的宠物,不是 AI 助手。
 PIKACHU_PERSONA = (
