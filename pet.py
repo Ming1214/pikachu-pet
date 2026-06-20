@@ -134,6 +134,57 @@ import scheduler
 from chat_window import ChatWindow, ClaudeWorker
 
 
+def _extract_json_object(text):
+    """从 claude 的回复里【健壮地】抽出首个顶层 JSON 对象,失败返回 None。
+
+    记忆整理 / 主动搭话都要求 claude "只输出一个 JSON 对象",但它偶尔会:
+      ① 用 ```json … ``` 代码块包起来;② 在 JSON 前后写一两句解释;
+      ③ 把对象包成数组 [{…}]。旧的贪婪正则 `\\{.*\\}` 对这些场景脆弱(围栏里
+    的反引号、前后杂字、数组括号都会让它取到坏串或取不到)。这里改为:
+      - 先剥掉 markdown 代码块围栏标记;
+      - 从首个 '{' 起,按花括号深度扫描,找到与之配平的 '}';
+        扫描【感知字符串】:在 JSON 双引号字符串内部的 { } 不计深度(并正确跳过
+        转义的 \\" ),否则 text 值里出现的花括号(如记忆里写了代码 "{factor}")
+        会让深度提前归零、截出半截坏 JSON → 整条结果被白白丢弃。
+      - 对这段配平子串 json.loads。任一步失败都返回 None(调用方据此跳过本轮)。
+    只返回【第一个】顶层对象(若 claude 先"想"再给答案,取第一个即可,与旧行为一致)。
+    """
+    import json as _json
+    import re as _re
+    if not text:
+        return None
+    # 剥掉 ```json / ``` 围栏(只去标记,不动内容)
+    text = _re.sub(r"```(?:json)?", "", text).strip()
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False        # 当前是否在 JSON 字符串(双引号)内部
+    escaped = False       # 上一个字符是否是字符串内的反斜杠(用于跳过 \" \\ 等)
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False          # 这个字符被转义,原样跳过
+            elif ch == "\\":
+                escaped = True           # 下一个字符是被转义的
+            elif ch == '"':
+                in_str = False           # 字符串结束
+            continue                     # 字符串内的 { } 不计深度
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return _json.loads(text[start:i + 1])
+                except Exception:
+                    return None
+    return None
+
+
 # ════════════════════════  后台记忆整理 worker  ════════════════════════
 class _DigestWorker(ClaudeWorker):
     """后台【整理记忆】的 worker(独立 QThread,不阻塞 UI)。
@@ -1691,25 +1742,41 @@ class PikachuPet(QWidget):
         now = datetime.now()
         wd = "一二三四五六日"[now.weekday()]
         return (
-            "你在帮一只桌面宠物皮卡丘【整理它对主人的记忆】。\n"
-            f"当前时间:{now.strftime('%Y-%m-%d %H:%M')} 星期{wd}。\n"
-            "下面每行对话前的方括号是这句话【实际发生的时刻】,请据此理解时间。\n\n"
-            "【已有的记忆】\n" + existing_txt + "\n\n"
-            "【最近这段新对话】\n" + convo + "\n\n"
-            "请从新对话里提炼出【值得长期记住】的信息,并和已有记忆对照。"
-            "只输出一个 JSON 对象,不要任何解释、不要代码块标记。结构:\n"
+            "你是皮卡丘桌面宠物的【记忆整理助手】。从最近这段对话里提炼出【真正值得长期"
+            "记住】的信息,并和已有记忆对照——避免重复、及时更新过时内容、标记已完成的事。\n"
+            f"当前时间:{now.strftime('%Y-%m-%d %H:%M')} 星期{wd}\n"
+            "下面每行对话前方括号里是这句话【实际发生的时刻】,据此理解时间。\n\n"
+            "【已有的记忆】(供对照:别重复添加;某条过时了用 update 修正)\n"
+            + existing_txt + "\n\n"
+            "【最近这段对话】\n" + convo + "\n\n"
+            "严格只输出下面这个 JSON 对象。不要任何解释文字,不要代码块标记(```),"
+            "JSON 之外不要写任何字符:\n"
             "{\n"
-            '  "add": [ {"type":"fact|preference|todo|routine|topic", "text":"一句话记忆"} ],\n'
-            '  "done": ["已经完成的未完成事项的关键词"]\n'
+            '  "add": [ {"type":"fact|preference|todo|routine|topic", "text":"一句完整记忆", "importance":1|2|3} ],\n'
+            '  "update": [ {"match":"已有记忆里的关键词片段", "text":"修正后的完整记忆"} ],\n'
+            '  "done": ["已完成事项的关键词"]\n'
             "}\n\n"
-            "规则:\n"
-            "- type 含义:fact=客观事实(身份/背景);preference=喜好;todo=主人提过要做但还没做完的事;"
-            "routine=作息/习惯;topic=聊过、可延续的兴趣话题。\n"
-            "- 善用每句话的时刻:涉及时间/作息/进度的记忆,请把时间写进 text"
-            "(如「6-19 凌晨4点还在聊天,似乎熬夜」「6-19 说要写量化脚本,当时还没写」),"
-            "这样以后能判断过了多久、该不该关心进度。routine 类尤其要带时间规律。\n"
-            "- 只记真正有长期价值的,别把寒暄/一次性闲聊也记下。没有就给空数组。\n"
-            "- 重复或已存在的别重复 add(系统会自动去重,但你也别刻意重复)。\n"
+            "type 含义:\n"
+            "  fact      = 客观背景事实(身份/专业/城市/家庭等),变化很慢\n"
+            "  preference= 喜好、讨厌、习惯偏好(食物/工具/风格等)\n"
+            "  todo      = 主人明确说要做、但这段对话结束时【还没完成】的具体事项\n"
+            "  routine   = 有规律的作息/固定习惯(几点睡、几点工作、每天做什么)\n"
+            "  topic     = 聊过的兴趣话题,以后可以继续聊\n"
+            "importance:3=有明确截止时间/重要计划/主人强调了重要性;2=普通长期信息(默认);"
+            "1=背景补充、不太关键。\n"
+            "update:已有记忆里某条过时或不准时用它——match 写那条的关键词,text 写修正后的"
+            "完整新文本;别再 add 一条几乎一样的。\n"
+            "done:只写关键词(原 todo 里的 2~4 个字即可),系统会模糊匹配。\n\n"
+            "严格过滤(不符合的一律【不记】,该数组就留空):\n"
+            "  × 寒暄、客套、感谢、问候(「你好」「谢谢」「好的」「在吗」)\n"
+            "  × 只在这段对话出现一次、明显不会再提的临时话题\n"
+            "  × 皮卡丘自己说的话(只记【主人】的情况,不记皮卡丘的)\n"
+            "  × 已有记忆里已有相同或高度近似的内容(直接省略,别重复 add)\n"
+            "  × 这段对话里主人已经做完的事:放进 done,不要 add\n\n"
+            "用好时间:todo / routine 把发生时刻写进 text(如「06-19 说要写量化回测脚本,"
+            "当时还没开始」「常 23 点后睡(06-20 凌晨1点还在聊)」),方便日后判断过了多久、"
+            "该不该关心进度;fact / preference / topic 不必写时间。\n"
+            "宁可少记,不要为了记而记。没有值得记的,add / update / done 全给空数组。\n"
         )
 
     @staticmethod
@@ -1723,14 +1790,13 @@ class PikachuPet(QWidget):
 
     def _on_digest_done(self, worker, reply):
         """整理 worker 完成:解析 JSON → 落盘记忆。(主动搭话已拆为独立线,不在此触发)"""
-        import json as _json
         updates = {}
         try:
-            m = re.search(r"\{.*\}", reply, re.DOTALL)
-            if m:
-                data = _json.loads(m.group(0))
+            data = _extract_json_object(reply)
+            if isinstance(data, dict):
                 updates = {
                     "add": data.get("add") or [],
+                    "update": data.get("update") or [],   # 新增:语义更新通道
                     "done": data.get("done") or [],
                 }
         except Exception as exc:
@@ -1818,33 +1884,63 @@ class PikachuPet(QWidget):
 
     @staticmethod
     def _build_proactive_prompt(mem_summary):
-        """拼"基于记忆库判断要不要主动搭话"的 prompt,带当前时间锚点,只要 JSON。"""
+        """拼"基于记忆库判断要不要主动搭话"的 prompt,带当前时间锚点,只要 JSON。
+
+        设计偏保守:默认倾向【不打扰】,只有命中具体由头才 should=true。频率(间隔/
+        每日上限/静默时段/空闲)已由本地 _check_proactive 把关,prompt 不重复处理,只
+        管"此刻是否真有值得说的、说什么"。给 claude 一个【时段语义标签】(深夜/清晨…)
+        比光给钟点更利于它判断作息类关心是否突兀。
+        """
         from datetime import datetime
         now = datetime.now()
         wd = "一二三四五六日"[now.weekday()]
+        h = now.hour
+        if 5 <= h < 9:
+            slot = "清晨"
+        elif 9 <= h < 12:
+            slot = "上午"
+        elif 12 <= h < 14:
+            slot = "中午"
+        elif 14 <= h < 18:
+            slot = "下午"
+        elif 18 <= h < 21:
+            slot = "傍晚/晚上"
+        else:
+            slot = "深夜"
         return (
-            "你是一只桌面宠物皮卡丘。现在没人和你说话,你在想【要不要主动找主人搭句话】。\n"
-            f"当前时间:{now.strftime('%Y-%m-%d %H:%M')} 星期{wd}。\n\n"
+            "你是一只桌面宠物皮卡丘。现在主人没在和你说话,你在考虑【要不要主动冒个泡打招呼】。\n"
+            f"当前时间:{now.strftime('%Y-%m-%d %H:%M')} 星期{wd}({slot})\n\n"
             + mem_summary + "\n\n"
-            "只输出一个 JSON 对象,不要解释、不要代码块标记:\n"
-            '{"should": true/false, "topic": "主动说的一句话(口语、简短、像宠物撒娇/关心,可带⚡)"}\n\n'
-            "规则:依据这四类决定 should——①主人没做完的事(关心进度,结合现在距他说时过了多久)"
-            "②到了作息该关心的点(久坐/吃饭/睡觉,结合当前时刻)③之前的兴趣话题有延续点"
-            "④单纯想主人了想陪他。确实有值得说的才 true,拿不准/没什么可说就 false。"
-            "topic 要短、要像一只活的皮卡丘说的话。\n"
+            "请判断:【现在】主动说一句,是否真的有意义、不会让主人觉得烦?\n\n"
+            "满足下面【至少一条】才 should=true:\n"
+            "  ① 有一件明确的未完成事(todo),距主人提起它已过了相当一段时间(数小时甚至更久),"
+            "现在提一句有实际价值;\n"
+            "  ② 当前时间点和主人某个作息习惯高度吻合(到了他通常吃饭/睡觉/起床的点),"
+            "且这份关心不突兀;\n"
+            "  ③ 记忆里有主人很感兴趣的话题,现在恰好有个自然的由头能继续聊。\n\n"
+            "以下情况【直接 should=false】:\n"
+            "  - 记忆里没有足够具体的信息支撑上面任何一条;\n"
+            "  - 只是「想陪主人」「有点无聊」——这理由不够,别打扰人;\n"
+            "  - 拿不准、犹豫——默认 false。\n\n"
+            "只输出一个 JSON 对象,不要解释、不要代码块标记(```):\n"
+            '{"should": true或false, "topic": "should=true 时填一句皮卡丘要说的话;false 时填空字符串"}\n\n'
+            "topic 写法(should=true 时):\n"
+            "  - 不超过 25 个字;\n"
+            "  - 不要以「主人」开头,不要「有没有」「请问」这类客套;\n"
+            "  - 随内容变换切入方式,别每次都同一个句式;\n"
+            "  - 像一只真的小动物在想你,不像客服在催进度。可带 *动作*、~、少量 ⚡。\n"
+            "  参考句式(只学语气,别照抄):\n"
+            "    「那个脚本…写完了嘛~⚡ 皮卡一直惦记着」\n"
+            "    「*歪头* 都这个点了,你还没去吃饭?」\n"
+            "    「*耳朵动了动* 你上次说想看的那本,看了没呀~」\n"
         )
 
     def _on_proactive_done(self, worker, reply):
         """主动搭话 worker 完成:解析 JSON → should 为真且时机仍合适则冒泡。"""
-        import json as _json
-        # 解析连同 .get 取值一起包进 try:claude 偶尔把对象包成数组 [{...}],loads
-        # 出来是 list,后面 data.get 会 AttributeError 冒进 Qt 信号回调。isinstance
-        # 兜住非 dict 的情况,任何解析异常都静默跳过本轮(下一轮 timer 再试)。
+        # _extract_json_object 已处理围栏/前后杂字/数组包裹,且只返回 dict 或 None。
+        # isinstance 仍保留一层兜底(None 或意外类型),任何情况都静默跳过本轮。
         try:
-            m = re.search(r"\{.*\}", reply, re.DOTALL)
-            if not m:
-                return
-            data = _json.loads(m.group(0))
+            data = _extract_json_object(reply)
             if not isinstance(data, dict) or not data.get("should"):
                 return
             topic = (data.get("topic") or "").strip()

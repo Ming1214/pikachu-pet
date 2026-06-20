@@ -366,12 +366,15 @@ def apply_digest(updates: dict, new_cursor: int) -> bool:
 
     updates 结构(全部可选,容错):
       {
-        "add":  [{"type","text"}, ...],        # 新增记忆
-        "update": [{"text", ...}],             # 语义更新(按近似去重命中则刷新权重/文本)
+        "add":  [{"type","text","importance":1|2|3}, ...],  # 新增记忆;importance 定初始权重
+        "update": [{"match","text"}, ...],     # 语义更新:match 关键词模糊命中已有记忆,替换其 text
         "done": ["<todo 文本或 id 片段>", ...]  # 标记完成的未完成事项
       }
     去重:新增前按 _norm(text) 与现有记忆比对,命中则视为"再次提及"→ 刷新
-    last_seen、权重回升,不重复添加。返回 True 仅当成功落盘。
+    last_seen、权重回升,不重复添加。importance(1/2/3)只用来定【新增条目的初始
+    权重】({1:0.7,2:1.0,3:1.5}),【不存进记忆记录】——旧档零迁移。
+    update 在 add 之后执行:确保新增项已进 index,update 重建 index key 不会和 add 打架。
+    返回 True 仅当成功落盘。
     """
     now = time.time()
     with _file_lock(MEMORY_LOCK_PATH):
@@ -405,6 +408,14 @@ def apply_digest(updates: dict, new_cursor: int) -> bool:
                 ex["weight"] = min(3.0, ex.get("weight", 1.0) + 0.5)
                 # todo 被重新提及通常意味着还没做完,保持 done 原状(不擅自翻转)
                 continue
+            # importance → 初始权重:3=重要(截止/强调)给 1.5,2=默认 1.0,1=背景 0.7。
+            # 重要的事起点更高 → 衰减再久也比普通记忆活得长(解决"几天前提的要紧事被忘")。
+            imp = item.get("importance", 2)
+            try:
+                imp = int(imp)
+            except (TypeError, ValueError):
+                imp = 2
+            init_weight = {1: 0.7, 2: 1.0, 3: 1.5}.get(imp, 1.0)
             mem = {
                 "id": _new_id(),
                 "type": typ,
@@ -412,11 +423,30 @@ def apply_digest(updates: dict, new_cursor: int) -> bool:
                 "created_at": now,
                 "last_seen": now,
                 "last_decay_at": now,      # 衰减基准:从创建起算,避免首轮就被衰减
-                "weight": 1.0,
+                "weight": init_weight,
                 "done": False if typ == "todo" else None,
             }
             mems.append(mem)
             index[nk] = mem
+
+        # 语义更新:用 match 关键词模糊命中已有记忆,替换 text、刷新时间、小幅回升权重。
+        # 放在 add 之后:此时 index 已含新增项;命中后重建 index key(旧 key 删、新 key 入),
+        # 避免后续按旧文本去重时找不到。每个 update 只改第一条命中(避免一次改花多条)。
+        for item in (updates.get("update") or []):
+            match_frag = _norm(str(item.get("match") or ""))
+            new_text = (item.get("text") or "").strip()
+            if not match_frag or not new_text:
+                continue
+            for m in mems:
+                if match_frag in _norm(m.get("text", "")):
+                    old_nk = _norm(m.get("text", ""))
+                    m["text"] = new_text[:300]
+                    m["last_seen"] = now
+                    m["weight"] = min(3.0, m.get("weight", 1.0) + 0.3)
+                    if old_nk in index:
+                        del index[old_nk]
+                    index[_norm(new_text)] = m
+                    break
 
         data["convo_cursor"] = new_cursor
         data["last_digest_at"] = now
@@ -459,10 +489,16 @@ def purge_memories(data: dict) -> None:
 
 # ───────────────────────────  注入聊天的记忆摘要  ───────────────────────────
 def recent_memory_summary(max_items: int | None = None) -> str:
-    """取高权重记忆拼成一段文本,注入正常聊天 prompt(让皮卡丘"记得"主人)。
+    """取高权重记忆拼成一段文本,注入聊天 / 主动搭话 prompt(让皮卡丘"记得"主人)。
 
     返回空串表示没有可用记忆(调用方据此不注入)。只取高权重前 N 条,保持简短。
-    未完成的 todo 单独点出,便于皮卡丘自然关心进度。
+    设计:
+      - 按 type 分组成【带标签的自然语句】(基本情况/喜好/作息/没做完的事/聊过的话题),
+        而不是扁平的"- xxx"罗列——claude 读到结构化分组,更容易自然地把记忆织进对话,
+        而非生硬念清单。
+      - 未完成的 todo 追加【多久前提过】的时间信号(今天/昨天/约 N 天前),由 last_seen
+        算。这个信号对【主动搭话】尤其关键(久搁的事才值得关心进度);它只在【输出文本】
+        里,不进 stored text,故不影响 _norm 去重。
     """
     if max_items is None:
         max_items = config.MEMORY_INJECT_TOP_N
@@ -476,19 +512,44 @@ def recent_memory_summary(max_items: int | None = None) -> str:
     top = sorted(mems, key=lambda x: x.get("weight", 0.0), reverse=True)[:max_items]
     if not top:
         return ""
-    lines = []
+
+    now = time.time()
+    sections: dict[str, list[str]] = {
+        "fact": [], "preference": [], "routine": [], "todo": [], "topic": []}
     for m in top:
-        txt = m.get("text", "").strip()
+        typ = m.get("type", "fact")
+        txt = (m.get("text") or "").strip()
         if not txt:
             continue
-        if m.get("type") == "todo" and not m.get("done"):
-            lines.append(f"- (他还没做完){txt}")
+        if typ == "todo" and not m.get("done"):
+            days_ago = max(0.0, (now - m.get("last_seen", now)) / 86400.0)
+            if days_ago < 1:
+                age = "今天提到过"
+            elif days_ago < 2:
+                age = "昨天提到过"
+            else:
+                age = f"约 {int(days_ago)} 天前提到过"
+            sections["todo"].append(f"{txt}({age},还没完成)")
+        elif typ in sections:
+            sections[typ].append(txt)
         else:
-            lines.append(f"- {txt}")
-    if not lines:
+            sections["fact"].append(txt)   # 未知 type 兜底归入基本情况
+
+    parts = []
+    if sections["fact"]:
+        parts.append("主人的基本情况:" + ";".join(sections["fact"]))
+    if sections["preference"]:
+        parts.append("主人的喜好:" + ";".join(sections["preference"]))
+    if sections["routine"]:
+        parts.append("主人的作息习惯:" + ";".join(sections["routine"]))
+    if sections["todo"]:
+        parts.append("主人还没做完的事:" + ";".join(sections["todo"]))
+    if sections["topic"]:
+        parts.append("聊过、可以延续的话题:" + ";".join(sections["topic"]))
+    if not parts:
         return ""
-    return "【关于主人,你已经记得这些事(自然地体现在对话里,别生硬罗列)】\n" + \
-        "\n".join(lines)
+    body = "\n".join(f"- {p}" for p in parts)
+    return "【皮卡丘记得的关于主人的事(聊天时自然地用上,别当清单念出来)】\n" + body
 
 
 # ───────────────────────────  主动搭话频率状态  ───────────────────────────

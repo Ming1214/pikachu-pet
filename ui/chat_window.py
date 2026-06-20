@@ -200,7 +200,10 @@ class _ChatInput(QTextEdit):
         self.setAcceptDrops(True)
         self.setAcceptRichText(False)        # 只收纯文本,避免粘进富文本格式
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # 垂直滚动条一律隐藏:AsNeeded 时 Qt 会画出原生上下步进箭头(那对小箭头很丑,
+        # 见反馈截图)。高度已在 [42,130] 自适应封顶,封顶后靠滚轮/方向键滚动即可,
+        # 不需要可见滚动条。设 Off 既去掉箭头,也省出右侧空间给文字。
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._min_h = 42                     # 约单行(含 padding)
         self._max_h = 130                    # 约 5 行后转为内部滚动
         self.setFixedHeight(self._min_h)
@@ -442,7 +445,12 @@ class ChatWindow(QWidget):
         self.input.setStyleSheet(
             "QTextEdit{background:#F4F4F4; border:2px solid #2B2B2B; border-radius:20px;"
             f"padding:7px 14px; font-size:14px; color:#2B2B2B; font-family:{FONT};}}"
-            "QTextEdit:focus{border-color:#EE1515; background:#FFFFFF;}")
+            "QTextEdit:focus{border-color:#EE1515; background:#FFFFFF;}"
+            # 双保险:把垂直滚动条画成 0 宽、无步进箭头(配合 ScrollBarAlwaysOff,
+            # 杜绝个别平台仍渲染原生上下箭头)。封顶后滚轮/方向键照常可滚。
+            "QTextEdit QScrollBar:vertical{width:0px;}"
+            "QTextEdit QScrollBar::add-line:vertical,"
+            "QTextEdit QScrollBar::sub-line:vertical{height:0px;}")
         row.addWidget(self.input, 1)
 
         self.send = QPushButton("➤")
