@@ -1499,12 +1499,44 @@ class PikachuPet(QWidget):
             # 收窗不中断 claude:后台跑完时若窗关着,本体冒气泡提醒回来看。
             self._chat.on_background_done = self._on_chat_background_done
         self._chat.show_near(self.frameGeometry())
-        # 聊天窗 show_near 里会 raise_()+activateWindow() 把自己抬到最上;同层时这会
-        # 盖住本体。原生 level(pet=5 > chat=3)已在系统层面保证本体在上,这里再于
-        # Qt 层补一记 raise_(),双保险:即便某些环境 level 没设上,也立刻把本体抬回顶。
-        self.raise_()
+        # 聊天窗 show_near 里 raise_()+activateWindow() 会把自己抬到最上盖住本体。
+        # 仅靠 showEvent 里设一次 pet level 不够:① activateWindow 是异步的,本帧内
+        # 同步 raise_ 可能被它随后翻掉;② Qt 在 Tool 窗激活/换焦点时可能重置 level。
+        # 所以这里【延一拍】(等 chat 的 activate 落定后)再重新钉 pet 的 NSWindow
+        # level 并 raise,确保本体稳稳压在聊天窗之上。_reassert_pet_top 幂等、可重入。
+        self._reassert_pet_top()
+        QTimer.singleShot(0, self._reassert_pet_top)
+        QTimer.singleShot(60, self._reassert_pet_top)
         # E2:把聊天窗没开时积压的定时任务结果补写进去,让用户看到到底做了啥。
         self._flush_pending_results()
+
+    def _reassert_pet_top(self):
+        """重新把本体钉到聊天窗之上:把本体 NSWindow level 设到【聊天窗实际 level 之上】
+        + Qt 层 raise_。
+
+        关键修正:不再写死 pet=5。WindowStaysOnTopHint 在不同 Qt/macOS 版本映射到的
+        level 不一定(可能 3,也可能 25/101…)——若 chat 实际是 25 而 pet 死设 5,
+        pet 反被盖住(正是之前截图里的现象)。改为【读出 chat 的真实 level,把 pet 设到
+        它 +2】,与映射无关地保证本体在上;读不到则退回安全档 5。
+
+        幂等可重入:setLevel/raise_ 重复调无副作用。配合 open_chat 里同步 + singleShot
+        0/60ms 多次调,覆盖聊天窗 activateWindow 的异步时序。聊天窗没开/隐藏时跳过。
+        """
+        if self._chat is None or not self._chat.isVisible():
+            return
+        try:
+            chat_lvl = macos_window.get_window_level(self._chat)
+        except Exception:
+            chat_lvl = None
+        pet_lvl = (chat_lvl + 2) if isinstance(chat_lvl, int) else 5
+        try:
+            macos_window.set_window_level(self, pet_lvl)
+        except Exception:
+            pass
+        try:
+            self.raise_()
+        except Exception:
+            pass
 
     def _flush_pending_results(self):
         """把暂存的定时任务结果补写进聊天窗。需聊天窗开着且空闲(互锁)才写,
@@ -1956,6 +1988,20 @@ def main():
     pet = PikachuPet()
     # 退出前清理在跑的 claude 线程/子进程,避免 QThread 崩溃与孤儿进程
     app.aboutToQuit.connect(pet.shutdown)
+
+    # 关键(D 修复):App 失活再激活时,macOS/Qt 会重新应用窗口层级,而聊天窗每次
+    # 激活都 raise_ 自己 → 皮卡丘掉到聊天窗后面(用户点了别的 App 再回来就被盖)。
+    # 监听 applicationStateChanged:每次 App 重新变为 Active,就把皮卡丘重新钉到
+    # 聊天窗之上。延一拍调:激活时 Qt 对各窗口的 raise/层级处理可能还没落定。
+    from PyQt6.QtCore import Qt as _Qt
+
+    def _on_app_state(state):
+        if state == _Qt.ApplicationState.ApplicationActive:
+            pet._reassert_pet_top()
+            QTimer.singleShot(0, pet._reassert_pet_top)
+            QTimer.singleShot(80, pet._reassert_pet_top)
+
+    app.applicationStateChanged.connect(_on_app_state)
 
     # 捕获 kill(SIGTERM)/ Ctrl-C(SIGINT):转成 Qt 的优雅退出(→aboutToQuit
     # →shutdown→清理)。SIGKILL(kill -9)无法捕获,由看门狗兜底。

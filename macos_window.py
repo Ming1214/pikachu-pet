@@ -113,3 +113,37 @@ def set_window_level(widget, level):
                 ctypes.c_long(int(level)))
     except Exception as exc:
         print(f"[macOS level] 设置失败(非致命):{exc}")
+
+
+def get_window_level(widget):
+    """读窗口当前的 NSWindow level(整数)。读不到 / 非 cocoa 返回 None。
+
+    用途:WindowStaysOnTopHint 在不同 Qt/macOS 版本下映射到的 level 不一定(可能是
+    3,也可能是 25 等)。要保证 A 永远压住 B,不能写死数值,而要读出 B 的【真实】
+    level、把 A 设到它之上(见 pet._reassert_pet_top)。
+    """
+    if sys.platform != "darwin":
+        return None
+    app = QApplication.instance()
+    if app is None or app.platformName() != "cocoa":
+        return None
+    try:
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.sel_registerName.restype = ctypes.c_void_p
+
+        view = ctypes.c_void_p(int(widget.winId()))
+        msg_p = objc.objc_msgSend
+        msg_p.restype = ctypes.c_void_p
+        msg_p.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        ns_window = msg_p(view, objc.sel_registerName(b"window"))
+        if not ns_window:
+            return None
+
+        msg_get = objc.objc_msgSend
+        msg_get.restype = ctypes.c_long
+        msg_get.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        return msg_get(ns_window, objc.sel_registerName(b"level"))
+    except Exception as exc:
+        print(f"[macOS level get] 读取失败(非致命):{exc}")
+        return None
