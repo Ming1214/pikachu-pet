@@ -320,6 +320,9 @@ class PikachuPet(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         macos_window.join_all_spaces(self)
+        # 本体 level 设得比聊天窗(3)高一档,保证 ASCII 皮卡丘永远浮在聊天窗之上,
+        # 不被刚打开/raise_ 的聊天窗盖住。和 raise 顺序无关,系统层面兜底。
+        macos_window.set_window_level(self, 5)
 
     # ---------- 绘制 ----------
     def paintEvent(self, event):
@@ -577,12 +580,16 @@ class PikachuPet(QWidget):
                 "border:1.5px solid rgba(255,220,60,160); border-radius:12px;"
                 f"padding:6px 10px; font-size:12px; font-weight:bold; font-family:{config.FONT_STACK};")
 
-    def show_bubble(self, text, sticky=False):
+    def show_bubble(self, text, sticky=False, ms=None):
         """sticky=True:常驻不自动消失,点击气泡才消失(用于定时提醒,点击=确认)。
 
         sticky 气泡之间不互相覆盖:已有未确认的 sticky 时,新 sticky 入队,
         当前只显示队首并标注"还有 N 条"。非 sticky(走路逗趣气泡)也不会
         顶掉未确认的 sticky 提醒——定时提醒优先级更高。
+
+        ms:非 sticky 气泡的停留毫秒数(默认 config.BUBBLE_DURATION_MS)。某些
+        场景(如定时任务开工提示)想多停一会儿但又不该常驻挡着,传更大的 ms 即可。
+        【注意】ms 仅对非 sticky 生效;sticky=True 时常驻到点击才消失,ms 被忽略。
         """
         if sticky:
             # W3 去重:同一条提醒(如每分钟的"该喝水啦")反复到点,不重复入队,
@@ -607,7 +614,7 @@ class PikachuPet(QWidget):
         if self._bubble_sticky:
             return
         self._render_bubble(text, sticky=False)
-        self._bubble_timer.start(config.BUBBLE_DURATION_MS)
+        self._bubble_timer.start(ms if ms is not None else config.BUBBLE_DURATION_MS)
 
     BUBBLE_MAX_W = 260   # 气泡最大宽度(超出则换行;放宽些让长引导文案行数更少)
 
@@ -654,8 +661,15 @@ class PikachuPet(QWidget):
             else:
                 self.bubble.adjustSize()
         bx = (self.width() - self.bubble.width()) // 2
-        # 顶部对齐到 2px;高度由上面算准,_win_h 顶部预留已加大以容纳多行气泡
-        self.bubble.move(max(2, bx), 2)
+        # 关键:把气泡【底边】贴到皮卡丘头顶上方一点点,而不是死贴窗口顶 y=2。
+        # 顶部预留 150px 是给最高的确认浮层/多行引导留的余量;短气泡若也固定在 y=2,
+        # 底边离头顶就有上百 px 空档,看着像飘在半空。改为按气泡实际高度倒推 y:
+        #   body_top = PAD + BUBBLE_TOP_RESERVE(皮卡丘第一行字的上沿)
+        #   y = body_top - 气泡高 - GAP,夹到 >=2 不越界。气泡越矮越往下贴近头顶。
+        body_top = self.PAD + self.BUBBLE_TOP_RESERVE
+        gap = 8
+        by = max(2, body_top - self.bubble.height() - gap)
+        self.bubble.move(max(2, bx), by)
         self.bubble.show()
         self.bubble.raise_()
         self._bubble_timer.stop()
@@ -1326,7 +1340,9 @@ class PikachuPet(QWidget):
             self.show_bubble(f"⚡ 皮卡丘忙不过来,稍等下再做「{desc[:10]}」", sticky=True)
             return
 
-        self.show_bubble(f"⚡ 皮卡丘开工:{desc[:12]}")
+        # 开工提示停久一点(8s):此前 2.6s 一闪而过,用户常没看清就没了。任务跑
+        # 完会有 sticky 完成气泡接上,所以这里不必常驻,8s 足够看清又不长期挡头顶。
+        self.show_bubble(f"⚡ 皮卡丘开工:{desc[:12]}", ms=8000)
         # W5:执行期间维持"think(挠头干活)"态,worker 完成才退出 ——
         # 让用户看出后台真的在忙,而不是 happy 2.2s 后就回去随机玩耍。
         self._flash_state("think", 600000)
@@ -1348,14 +1364,32 @@ class PikachuPet(QWidget):
         self._sched_workers.append(worker)
         worker.start()
 
+    def _chat_can_write_now(self) -> bool:
+        """聊天窗是否"开着且空闲",可以直接把定时任务结果写进去。
+
+        互锁:若聊天窗正有一条用户对话在跑(_worker 在跑且没被取消),此刻直接
+        写定时结果会和那条对话的回复交错出现两条气泡,看着像重复。这种情况返回
+        False → 调用方改为 _stash_result,等聊天空了/重开窗时补写,避免交错。
+        """
+        if self._chat is None or not self._chat.isVisible():
+            return False
+        w = getattr(self._chat, "_worker", None)
+        if w is not None and w.isRunning() and not getattr(w, "cancelled", False):
+            return False
+        return True
+
     def _on_sched_done(self, task, reply):
         self._flash_state("cheer", 2600)   # 任务成功:大放电庆祝(思考中不打断)
         desc = task.get("desc", "任务")
         # 完成也用常驻气泡,点击确认才消失(免得你没看到)。提示可去聊天窗看详情。
         self.show_bubble(f"✅ 完成「{desc[:14]}」(双击我看皮卡丘做了啥)", sticky=True)
-        full = f"*得意地翘尾巴* 定时任务「{desc}」搞定啦!⚡\n{reply}"
-        # E2:聊天窗开着直接写入;没开则存起来,等用户打开聊天窗补看,不丢结果。
-        if self._chat is not None and self._chat.isVisible():
+        # 加一行 ⏰ 标记前缀(只标"这是哪条定时任务",不重复结果措辞)+ claude 的
+        # 真实汇报。此前的旧前缀是"定时任务「…」搞定啦!⚡",和 reply 里的"搞定啦"
+        # 撞车看着像说两遍;改成纯 ⏰+任务描述,既点明出处又不和 reply 内容重复。
+        full = f"⏰ 定时任务「{desc}」\n{reply}"
+        # E2 + 互锁:聊天窗开着且空闲才直接写;正忙(有用户对话在跑)或没开则
+        # 暂存,等空了/重开窗补写,避免和用户那条对话的回复交错成两条。
+        if self._chat_can_write_now():
             self._chat._add("皮卡", full)
         else:
             self._stash_result(full)
@@ -1365,7 +1399,7 @@ class PikachuPet(QWidget):
         desc = task.get("desc", "")
         self.show_bubble(f"⚠️ 没做成「{desc[:10]}」(双击我看详情)", sticky=True)
         full = f"*耷拉耳朵* 「{desc}」没做成…{err[:80]}"
-        if self._chat is not None and self._chat.isVisible():
+        if self._chat_can_write_now():
             self._chat._add("皮卡", full)
         else:
             self._stash_result(full)
@@ -1465,11 +1499,27 @@ class PikachuPet(QWidget):
             # 收窗不中断 claude:后台跑完时若窗关着,本体冒气泡提醒回来看。
             self._chat.on_background_done = self._on_chat_background_done
         self._chat.show_near(self.frameGeometry())
+        # 聊天窗 show_near 里会 raise_()+activateWindow() 把自己抬到最上;同层时这会
+        # 盖住本体。原生 level(pet=5 > chat=3)已在系统层面保证本体在上,这里再于
+        # Qt 层补一记 raise_(),双保险:即便某些环境 level 没设上,也立刻把本体抬回顶。
+        self.raise_()
         # E2:把聊天窗没开时积压的定时任务结果补写进去,让用户看到到底做了啥。
-        if self._pending_results:
-            pending, self._pending_results = self._pending_results, []
-            for text in pending:
-                self._chat._add("皮卡", text)
+        self._flush_pending_results()
+
+    def _flush_pending_results(self):
+        """把暂存的定时任务结果补写进聊天窗。需聊天窗开着且空闲(互锁)才写,
+        否则留着等下次(open_chat / 聊天 worker 完成 / 重开窗)再补,绝不丢。
+
+        触发点:① open_chat 打开窗时;② _exit_thinking 聊天那条对话刚回复完、
+        worker 空了时(覆盖"任务完成时聊天正忙→暂存→现在聊天空了"的补写)。
+        """
+        if not self._pending_results:
+            return
+        if not self._chat_can_write_now():
+            return
+        pending, self._pending_results = self._pending_results, []
+        for text in pending:
+            self._chat._add("皮卡", text)
 
     def _on_local_schedule(self, desc):
         """聊天窗快通道本地建任务后回调:本体放电 + 冒确认气泡。"""
@@ -1503,6 +1553,12 @@ class PikachuPet(QWidget):
         一结束本体就切 idle,定时任务在跑却毫无视觉指示)。
         """
         self._thinking_active = False
+        # 互锁补写:这条用户对话刚回复完,把聊天忙时暂存的定时任务结果补进去
+        # (此前因 _chat_can_write_now 为 False 被 stash)。延一拍再 flush:
+        # thinking_ended 在 _reply 里发出时,聊天 worker 的 QThread 可能还没真正
+        # finished(isRunning 仍 True)→ 此刻 _chat_can_write_now 会判忙、补写被跳过。
+        # singleShot(120) 让 worker 收尾、_cleanup_worker 清掉 _worker 后再补写。
+        QTimer.singleShot(120, self._flush_pending_results)
         if self._alive_workers() > 0:
             # 后台定时任务仍在跑 → 接续思考态(它完成时 _on_sched_done 会收尾)
             self._set_state("think", 600000)

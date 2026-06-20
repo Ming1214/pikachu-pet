@@ -69,3 +69,47 @@ def join_all_spaces(widget):
                 ctypes.c_ulong(behavior))
     except Exception as exc:
         print(f"[macOS spaces] 设置失败(非致命):{exc}")
+
+
+def set_window_level(widget, level):
+    """给窗口设原生 NSWindow level(数值越大越靠上层)。
+
+    背景:皮卡丘本体和聊天窗都用 Qt 的 WindowStaysOnTopHint,Qt 把两者映射到
+    同一个 NSWindow level → 同层时谁后 raise_/activate 谁在上。聊天窗 show_near
+    每次都 raise_()+activateWindow(),于是总把本体盖住。让本体的 level 比聊天窗
+    高一档,就能在系统层面保证本体永远浮在聊天窗之上,与 raise 顺序无关。
+
+    常用 level 参考:NSNormalWindowLevel=0、NSFloatingWindowLevel=3、
+    NSModalPanelWindowLevel=8、NSMainMenuWindowLevel=24、NSStatusWindowLevel=25。
+    本体传一个比聊天窗大的值即可(本项目用 pet=5, chat=3)。
+    【上限红线】传给本体的值【必须 < 8】:>=8 会浮到原生模态弹窗(文件选择 sheet、
+    NSAlert 确认框)之上,把皮卡丘盖在系统对话框上、用户没法先关掉它 → 卡死交互。
+    更不能 >=24,否则盖住菜单栏。pet=5 落在 floating(3)与 modal(8)之间,既压住
+    聊天窗、又乖乖低于所有系统弹窗/菜单栏,是安全档位。
+    失败不致命(非 cocoa 平台 / winId 不是 NSView 时静默跳过)。
+    """
+    if sys.platform != "darwin":
+        return
+    app = QApplication.instance()
+    if app is None or app.platformName() != "cocoa":
+        return
+    try:
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.sel_registerName.restype = ctypes.c_void_p
+
+        view = ctypes.c_void_p(int(widget.winId()))
+        msg_p = objc.objc_msgSend
+        msg_p.restype = ctypes.c_void_p
+        msg_p.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        ns_window = msg_p(view, objc.sel_registerName(b"window"))
+        if not ns_window:
+            return
+
+        msg_set = objc.objc_msgSend
+        msg_set.restype = None
+        msg_set.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+        msg_set(ns_window, objc.sel_registerName(b"setLevel:"),
+                ctypes.c_long(int(level)))
+    except Exception as exc:
+        print(f"[macOS level] 设置失败(非致命):{exc}")

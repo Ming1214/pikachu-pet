@@ -212,6 +212,11 @@ class ChatWindow(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         macos_window.join_all_spaces(self)
+        # 聊天窗 level 显式设为 3(= WindowStaysOnTopHint 在 Cocoa 下本就映射到的
+        # NSFloatingWindowLevel):严格说是冗余,但写明白意图——聊天窗浮在普通应用
+        # 之上、又比皮卡丘本体(5)低一档,本体的 ASCII 形象始终可见盖不住。
+        # 留作显式断言,万一日后 Qt 的映射变了,这行仍把它钉回 3。
+        macos_window.set_window_level(self, 3)
 
     def hideEvent(self, event):
         """收起/关闭聊天窗 = 只把窗藏起来,【不】中断正在跑的 claude。
