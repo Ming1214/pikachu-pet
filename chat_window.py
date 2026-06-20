@@ -16,8 +16,8 @@ from PyQt6.QtGui import (
     QBrush, QColor, QPainter, QPainterPath, QPixmap, QPen,
 )
 from PyQt6.QtWidgets import (
-    QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QApplication, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel,
+    QLineEdit, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 import claude_bridge
@@ -196,6 +196,8 @@ class ChatWindow(QWidget):
         self._thinking_fixed = None
         # "正在想"气泡下方的时间戳 QLabel:回复完成时刷新成回复时刻(而非提问时刻)。
         self._thinking_time = None
+        # "正在想"气泡的复制按钮:占位时隐藏,真回复落定(_release_thinking)才 show。
+        self._thinking_copy = None
         self._pending_user = ""
         self._history = []
         # claude 不可用降级时,只在【本窗口首次】降级带完整提示(那句很长,解释要装
@@ -335,6 +337,9 @@ class ChatWindow(QWidget):
     @staticmethod
     def _set_html(label, text):
         import html as _h
+        # 把原始纯文本挂在 label 上,供"复制"按钮取用(label.text() 拿到的是带 HTML
+        # 标签的富文本,不能直接复制)。富文本展示走下面的 setText;复制走 _raw_text。
+        label._raw_text = text
         safe = _h.escape(text).replace("\n", "<br>")
         label.setText(f"<div style='line-height:150%;'>{safe}</div>")
 
@@ -350,13 +355,54 @@ class ChatWindow(QWidget):
                        else Qt.AlignmentFlag.AlignLeft)
         return t
 
+    def _copy_button(self, source_label):
+        """生成一个"复制"小按钮,点一下把 source_label 的原始文本写进系统剪贴板。
+
+        只挂在皮卡丘回复气泡下方(用户自己说的话不必加)。复制取 source_label._raw_text
+        (_set_html 时存的纯文本),而非 label.text()(那是带 <div>/<br> 标签的富文本)。
+        """
+        btn = QPushButton("📋 复制")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFlat(True)
+        btn.setStyleSheet(
+            "QPushButton{color:#9AA0A6; font-size:10px; background:transparent;"
+            f"border:none; padding:2px 4px 0 4px; font-family:{FONT};}}"
+            "QPushButton:hover{color:#EE1515;}")   # 悬停变精灵球红,提示可点
+        btn.clicked.connect(lambda: self._copy_to_clipboard(source_label, btn))
+        return btn
+
+    def _copy_to_clipboard(self, source_label, btn):
+        """把气泡原始文本复制到系统剪贴板,并把按钮文案短暂切成"✓ 已复制"反馈。"""
+        try:
+            text = getattr(source_label, "_raw_text", "") or ""
+            QApplication.clipboard().setText(text)
+        except Exception:
+            return
+        btn.setText("✓ 已复制")
+        # 1.5s 后恢复成"📋 复制"。用 lambda 守卫:气泡可能已被销毁(理论上不会,
+        # 但收窗/重建场景保险些),setText 抛 RuntimeError 就忽略。
+        def _restore():
+            try:
+                btn.setText("📋 复制")
+            except RuntimeError:
+                pass
+        QTimer.singleShot(1500, _restore)
+
     def _add(self, who, text):
         b = self._bubble(who, text)
         ts = self._time_label(who)
         # 气泡 + 时间戳竖直叠放,再整体左/右对齐
         col = QVBoxLayout(); col.setContentsMargins(0, 0, 0, 0); col.setSpacing(1)
         col.addWidget(b)
-        col.addWidget(ts)
+        # 皮卡丘回复:时间戳 + 复制按钮并排放在气泡下方左侧;用户气泡只放时间戳。
+        if who == "你":
+            col.addWidget(ts)
+        else:
+            meta = QHBoxLayout(); meta.setContentsMargins(0, 0, 0, 0); meta.setSpacing(2)
+            meta.addWidget(ts)
+            meta.addWidget(self._copy_button(b))
+            meta.addStretch()
+            col.addLayout(meta)
         col.setAlignment(b, Qt.AlignmentFlag.AlignRight if who == "你"
                          else Qt.AlignmentFlag.AlignLeft)
         row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
@@ -390,7 +436,15 @@ class ChatWindow(QWidget):
         # 时间戳此刻显示的是"提问时刻",但真正有意义的是【回复完成时刻】——
         # 留个引用,等 _reply/_error 回复落定时刷新成那一刻(见 _stamp_thinking_time)。
         self._thinking_time = self._time_label("皮卡")
-        col.addWidget(self._thinking_time)
+        # 复制按钮先建好但隐藏:"正在想…"占位文本不该被复制,等 _release_thinking
+        # 把真回复填进这个气泡(b 即真回复 label)后再 show 出来。
+        self._thinking_copy = self._copy_button(b)
+        self._thinking_copy.hide()
+        meta = QHBoxLayout(); meta.setContentsMargins(0, 0, 0, 0); meta.setSpacing(2)
+        meta.addWidget(self._thinking_time)
+        meta.addWidget(self._thinking_copy)
+        meta.addStretch()
+        col.addLayout(meta)
         col.setAlignment(b, Qt.AlignmentFlag.AlignLeft)
         row.addLayout(col); row.addStretch()
         self.msgs.insertLayout(self.msgs.count() - 1, row)
@@ -746,6 +800,13 @@ class ChatWindow(QWidget):
             except RuntimeError:
                 pass                         # label 已随气泡销毁则忽略
             self._thinking_time = None
+        # 真回复(或错误文案)已填进气泡 → 亮出复制按钮(此前在 _add_thinking 里隐藏)。
+        if getattr(self, "_thinking_copy", None) is not None:
+            try:
+                self._thinking_copy.show()
+            except RuntimeError:
+                pass
+            self._thinking_copy = None
         self.thinking_ended.emit()          # 让桌宠本体退出思考态
 
     def _reply(self, text, sender=None):
