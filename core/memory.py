@@ -121,7 +121,6 @@ def _file_lock(lock_path: str):
                 pass
     finally:
         proc_lock.release()
-        lf.close()
 
 
 def _atomic_write(path: str, text: str) -> bool:

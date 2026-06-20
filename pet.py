@@ -664,7 +664,10 @@ class PikachuPet(QWidget):
             # (用户正在看的那条)不被挤掉,从次旧的开始丢。
             if len(self._sticky_queue) > config.STICKY_QUEUE_MAX:
                 # 丢掉索引 1(次旧),保住队首[0]
-                del self._sticky_queue[1]
+                dropped = self._sticky_queue.pop(1)
+                # 若被丢的是主动搭话话题,同步从 _proactive_topics 移除——否则那个集合
+                # 只在用户【点击】气泡时才 discard,被队列挤掉的话题会永久残留、缓慢膨胀。
+                self._proactive_topics.discard(dropped)
             # 当前没在显示 sticky → 立刻弹队首;否则只刷新角标,不覆盖正在看的那条
             if not self._bubble_sticky:
                 self._show_next_sticky()
@@ -1162,6 +1165,10 @@ class PikachuPet(QWidget):
             # 同一 req_id 只处理一次(offset 游标已防重读,这是防文件截断重读的二道保险)
             if req_id in self._seen_confirm_ids:
                 continue
+            # 封顶:这是个只增不删的去重集,长会话里会缓慢膨胀。超阈值就整体清空
+            # (旧 req_id 对应的 hook 早已超时/处理完,不会再来,清掉无副作用)。
+            if len(self._seen_confirm_ids) >= 1000:
+                self._seen_confirm_ids.clear()
             self._seen_confirm_ids.add(req_id)
             # ① 暂停硬超时:hook 此刻正阻塞等确认,告诉 claude_bridge 别让它超时被杀。
             #    用计数器 begin_await:多条并发待确认各登记一次,全部结束才恢复倒计时。
@@ -1958,6 +1965,10 @@ class PikachuPet(QWidget):
         if self._t.elapsed() - self._last_interact < config.PROACTIVE_IDLE_MIN_MS:
             return
         # 通过 → 冒主动搭话气泡(sticky,点击展开聊天窗)。记进 set,点击时认得出它。
+        # 封顶兜底:正常情况下话题会在点击或队列淘汰时被 discard,但极端下(从不点击、
+        # 也没触发淘汰)仍可能缓慢累积,超阈值就整体清空(旧话题早已不在显示,清掉无害)。
+        if len(self._proactive_topics) >= 200:
+            self._proactive_topics.clear()
         self._proactive_topics.add(topic)
         self._flash_state("happy", 2200)
         self.show_bubble(topic, sticky=True)
@@ -2068,6 +2079,18 @@ class PikachuPet(QWidget):
                 self._confirm_timer.stop()
         except Exception:
             pass
+        # 同理停掉其余所有 timer:下面 w.wait() 会泵事件循环,期间动画/调度/整理/搭话
+        # timer 若仍在跑,可能在退出中途【新建】不在本次 cancel 列表里的 worker
+        # (_sched_timer→_check_scheduled、_digest_timer/_proactive_timer→后台 worker)
+        # → 这些新 worker 的 claude 子进程没人 kill,变孤儿;_anim 也会做无谓状态切换。
+        for _t in ("_anim", "_sched_timer", "_tool_evt_timer",
+                   "_digest_timer", "_proactive_timer"):
+            try:
+                _timer = getattr(self, _t, None)
+                if _timer is not None:
+                    _timer.stop()
+            except Exception:
+                pass
         workers = list(self._sched_workers)
         # 后台记忆整理 worker 也要一并 cancel + join:否则退出时它仍在跑 →
         # 「QThread: Destroyed while thread is still running」+ claude 子进程变孤儿。

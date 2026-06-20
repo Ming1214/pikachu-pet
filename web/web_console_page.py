@@ -385,7 +385,7 @@ function toast(msg,kind){ const t=Q("#toast"); t.textContent=msg;
   t.className="toast show"+(kind?(" "+kind):"");
   clearTimeout(_toastTimer);
   _toastTimer=setTimeout(()=>t.classList.remove("show"),2000); }
-function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function jsAttr(s){ return JSON.stringify(String(s==null?"":s))
   .replace(/&/g,"&amp;").replace(/'/g,"&#39;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 // epoch 秒 → 本地时间字符串(危险/对话流水用)

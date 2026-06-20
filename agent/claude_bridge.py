@@ -625,6 +625,14 @@ def ask_pikachu(
             f"皮卡丘想了太久(超过 {config.CLAUDE_TIMEOUT_SEC} 秒)…可以让它做小一点的任务。"
         )
 
+    # 复查取消:done.wait 返回与 cancel 置位可能在同一窗口内竞态——若用户刚点了取消、
+    # reader 又恰好在这一瞬完成,不复查就会把"已取消"的回复照常返给用户(取消形同失效)。
+    if cancel_event is not None and cancel_event.is_set():
+        _kill_proc_tree(proc)
+        done.wait(timeout=3)
+        _log_call("chat", _t0, False, _plen, 0)
+        raise ClaudeError("已取消~")
+
     stdout = holder.get("out", "") or ""
     stderr = holder.get("err", "") or ""
 
@@ -718,6 +726,12 @@ def ask_raw(prompt: str, *, timeout_sec: int = 45,
         _kill_proc_tree(proc); done.wait(timeout=3)
         _log_call("raw", _t0, False, _plen, 0)
         raise ClaudeError("解析超时")
+
+    # 复查取消(理由同 ask_pikachu):wait 返回与 cancel 置位可能同窗口竞态。
+    if cancel_event is not None and cancel_event.is_set():
+        _kill_proc_tree(proc); done.wait(timeout=3)
+        _log_call("raw", _t0, False, _plen, 0)
+        raise ClaudeError("已取消")
 
     stdout = holder.get("out", "") or ""
     if proc.returncode != 0:

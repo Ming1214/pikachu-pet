@@ -288,6 +288,10 @@ def _cleanup_garbage_paths():
     # 配置覆盖文件的原子写残留:只清自己 pid 的 .tmp,不删 config_overrides.json 本体
     # (用户配置,退出保留;理由同 scheduled_tasks.json)。
     paths += glob.glob(os.path.join(BASE_DIR, f"config_overrides.json.{own}.tmp"))
+    # pet_settings.json 的原子写残留(_ensure_pet_settings 同样走 <path>.<pid>.tmp):
+    # 只清自己 pid 的 .tmp,不删 pet_settings.json 本体。补齐——之前漏了这一条,
+    # 崩溃在 write→replace 之间会留下 pet_settings.json.<pid>.tmp 永不回收。
+    paths += glob.glob(os.path.join(BASE_DIR, f"pet_settings.json.{own}.tmp"))
     return paths
 
 # ── 首次引导(E1)──

@@ -91,28 +91,51 @@ def schedule_task(
         "enabled": True,
         "kind": kind,
     }
+    # 模型可能把数值参数传成 "1.5"、"30 minutes"、null 等非整数 → 裸 int() 会抛
+    # ValueError,被 FastMCP 包成丑陋的 "invalid literal for int()" 错误返给 claude,
+    # 易让它误判重试。统一用守卫转换,非整数时返回干净中文错误串。
+    def _as_int(val, field):
+        try:
+            return int(val), None
+        except (TypeError, ValueError):
+            return None, f"ERROR: {field} 必须是整数。"
+
     if kind == "daily":
-        if not (0 <= int(hour) <= 23 and 0 <= int(minute) <= 59):
+        h, e = _as_int(hour, "hour")
+        if e: return e
+        m, e = _as_int(minute, "minute")
+        if e: return e
+        if not (0 <= h <= 23 and 0 <= m <= 59):
             return "ERROR: hour 必须 0-23、minute 必须 0-59。"
-        task["hour"] = int(hour); task["minute"] = int(minute)
+        task["hour"] = h; task["minute"] = m
     elif kind == "weekly":
         # 校验越界:weekday 越界会让 describe 崩溃(IndexError)或任务永不触发;
         # hour/minute 越界则静默永不触发。一律拒绝并提示 claude 改正。
-        if not (0 <= int(weekday) <= 6):
+        wd, e = _as_int(weekday, "weekday")
+        if e: return e
+        h, e = _as_int(hour, "hour")
+        if e: return e
+        m, e = _as_int(minute, "minute")
+        if e: return e
+        if not (0 <= wd <= 6):
             return "ERROR: weekday 必须 0-6(0=周一,6=周日)。"
-        if not (0 <= int(hour) <= 23 and 0 <= int(minute) <= 59):
+        if not (0 <= h <= 23 and 0 <= m <= 59):
             return "ERROR: hour 必须 0-23、minute 必须 0-59。"
-        task["weekday"] = int(weekday)
-        task["hour"] = int(hour); task["minute"] = int(minute)
+        task["weekday"] = wd
+        task["hour"] = h; task["minute"] = m
     elif kind == "once":
-        if int(after_sec) <= 0:
+        sec, e = _as_int(after_sec, "after_sec")
+        if e: return e
+        if sec <= 0:
             return "ERROR: after_sec 必须 > 0(多少秒后触发)。"
-        task["fire_at"] = now + int(after_sec)
+        task["fire_at"] = now + sec
     elif kind == "interval":
-        if int(every_sec) <= 0:
+        sec, e = _as_int(every_sec, "every_sec")
+        if e: return e
+        if sec <= 0:
             return "ERROR: every_sec 必须 > 0(每隔多少秒)。"
-        task["every_sec"] = int(every_sec)
-        task["next_at"] = now + int(every_sec)
+        task["every_sec"] = sec
+        task["next_at"] = now + sec
     else:
         return f"ERROR: 未知的 kind「{kind}」,必须是 daily/weekly/once/interval。"
 

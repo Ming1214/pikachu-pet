@@ -658,12 +658,14 @@ def after_fire(task: dict, tasks: list[dict], stamp: str | None = None):
       "你提醒我了吗?"时 claude 查不到任务,会误以为"从没建过/没做好"而自责瞎编。
       done 任务过段时间(见 purge_old_done)再清理。
     interval:顺延 next_at(基于上一个预定时刻递增,消除轮询延迟的累积漂移)。
-    daily/weekly:持久化本次触发的分钟 stamp,防止同一分钟内进程重启重复触发。
+    daily/weekly:持久化本次触发的 dedup_key,防止进程重启后同一天/同一周重复触发。
 
     Args:
         tasks: 调用方(pet 轮询)读到的任务快照,仅作兼容保留;实际更新在锁内
             重新 load 最新磁盘内容进行,不会覆写这个可能已过时的快照。
-        stamp: 本次触发的 'YYYYmmddHHMM' 分钟标记(daily/weekly 持久化去重用)。
+        stamp: 本次触发的 dedup_key(daily=日期'YYYYMMDD'、weekly=年周'YYYYWww'),
+            供 daily/weekly 持久化去重用——必须与 is_due 比较的 dedup_key 同格式。
+            调用方(pet._check_scheduled)传入的就是 scheduler.dedup_key(task, now)。
 
     Returns:
         True  = 状态变更已落盘(或本就无需变更)。
