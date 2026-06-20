@@ -12,6 +12,7 @@
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -30,6 +31,42 @@ class ClaudeError(Exception):
 # 缓存避免每次发消息都走一遍 shutil.which(查 PATH 是系统调用);代价是用户
 # 运行期间才装好 claude 需重启(或调 invalidate_claude_cache)才生效——可接受。
 _claude_ok_cache = None
+
+# 危险操作确认:hook 拦截后会阻塞等用户点确认气泡,这段"等人"时间不该计入硬超时。
+# 用【计数器】而非单个 Event:可能同时有多条危险操作在等确认(或并发的多个 claude
+# 调用各自在等),计数 >0 表示"还有人在等人类",ask_pikachu 的超时循环据此暂停 deadline。
+# 计数器(而非 bool/Event)保证:A 调用的确认解决后递减,不会误把 B 调用仍在等的暂停态
+# 一并清掉——只有所有等待都结束(归零)才真正恢复倒计时。pet.py 轮询到 pending 时
+# begin_await(),确认/拒绝/超时回收时 end_await()。与 ask_pikachu 同进程,跨线程可见。
+_await_lock = threading.Lock()
+_await_count = 0
+
+
+def begin_await() -> None:
+    """登记一条"正在等用户确认"。桌宠轮询到新 pending 时调。"""
+    global _await_count
+    with _await_lock:
+        _await_count += 1
+
+
+def end_await() -> None:
+    """注销一条等待(确认/拒绝/超时回收时调)。下限 0,重复调不会变负。"""
+    global _await_count
+    with _await_lock:
+        if _await_count > 0:
+            _await_count -= 1
+
+
+def reset_await() -> None:
+    """清零等待计数(shutdown 用:退出时不再等任何人)。"""
+    global _await_count
+    with _await_lock:
+        _await_count = 0
+
+
+def _is_awaiting() -> bool:
+    with _await_lock:
+        return _await_count > 0
 
 
 def claude_available() -> bool:
@@ -133,6 +170,48 @@ def _ensure_mcp_config() -> str | None:
         return None
 
 
+def _ensure_pet_settings() -> str | None:
+    """生成(若不存在则写)挂载危险操作守门 hook 的 settings 文件,返回其路径。
+
+    经 `--settings <path>` 注入,只对本次 claude 调用生效,【不污染】用户全局
+    ~/.claude/settings.json。matcher=Bash 让 hook 只在 Bash 工具调用前触发(其余工具
+    零开销)。timeout=300 > CONFIRM_HOOK_TIMEOUT_SEC(280),给 hook 留足阻塞等确认的时间。
+    生成失败返回 None(降级为不挂 hook;此时 A 层硬拦截失效,靠 B 层软护栏兜底)。
+    """
+    try:
+        cfg = {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                # Claude Code 把 command 字段交给 shell 执行,会按空格分词。
+                                # macOS 用户名常含空格/中文(如 /Users/John Smith/…),不 quote
+                                # 会被拆错 → hook 启动失败、A 层硬拦截静默失效。用 shlex.quote
+                                # 把解释器路径和脚本路径各自包好,空格路径也能正确启动。
+                                "command": (
+                                    f"{shlex.quote(sys.executable or 'python3')} "
+                                    f"{shlex.quote(config.GUARDIAN_PATH)}"
+                                ),
+                                "timeout": 300,
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        # 原子写,理由同 _ensure_mcp_config:并发两条消息同时进来不会写出损坏 JSON。
+        tmp = f"{config.PET_SETTINGS_PATH}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, config.PET_SETTINGS_PATH)
+        return config.PET_SETTINGS_PATH
+    except Exception:
+        return None
+
+
 def _scheduling_hint() -> str:
     """告诉 claude 它有定时任务工具,以及当前时间(用于把'今晚''3分钟后'换算成参数)。"""
     from datetime import datetime
@@ -220,6 +299,13 @@ def ask_pikachu(
         cmd += ["--mcp-config", mcp_cfg,
                 "--allowedTools", ",".join(config.MCP_ALLOWED_TOOLS)]
 
+    # 挂载危险操作守门 hook(A 层硬拦截):rm -rf / git push --force / sudo 等不可逆
+    # 命令在执行前被 hook 拦下,阻塞等用户在桌宠上点确认气泡。只对本次调用生效,不污染
+    # 全局配置。生成失败则降级为不挂(靠 B 层软护栏兜底)。
+    pet_settings = _ensure_pet_settings()
+    if pet_settings:
+        cmd += ["--settings", pet_settings]
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -267,9 +353,15 @@ def ask_pikachu(
     timed_out = True
     while time.monotonic() < deadline:
         if cancel_event is not None and cancel_event.is_set():
-            _kill_proc_tree(proc)
+            _kill_proc_tree(proc)        # killpg 连 hook 子进程一起杀,不残留阻塞
             done.wait(timeout=3)
             raise ClaudeError("已取消~")
+        # 危险操作确认暂停:hook 拦截后桌宠会 begin_await(),此刻 claude 子进程正阻塞在
+        # hook 里等用户点确认。把 deadline 持续后移,使这段"等人"时间不计入硬超时——
+        # 否则用户慢慢考虑要不要删,500s 到点会误杀正等确认的调用。计数归零(所有等待
+        # 都结束:确认/拒绝/桌宠侧超时回收)后,deadline 不再被后移,恢复正常倒计时。
+        if _is_awaiting():
+            deadline = time.monotonic() + config.CLAUDE_TIMEOUT_SEC
         if done.wait(timeout=step):
             timed_out = False
             break

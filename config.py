@@ -4,6 +4,7 @@
 """
 
 import os
+import re
 
 # ─────────────────────────────  路径  ─────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -121,14 +122,53 @@ FONT_STACK = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif'
 # ─────────────────────────────  Claude CLI 集成  ─────────────────────────────
 CLAUDE_BIN = "claude"
 CLAUDE_WORKDIR = os.path.expanduser("~/Desktop/Claude-Code")
-# 硬超时上限(最终兜底)。原 300s(5 分钟)对闲聊卡住太久——一句问候不该让用户
-# 干等 5 分钟才报错。降到 180s:够真实写文件/跑命令的任务用,又不至于卡死太久。
+# 硬超时上限(最终兜底)。原 180s 对【危险操作确认】不够用:hook 拦截后会阻塞
+# 等用户点确认气泡,这段"等人"时间不该计入超时(见 claude_bridge._awaiting_human
+# 暂停逻辑)。即便暂停逻辑漏触发,500s 也作为第二道保险,不至于在用户还没点完
+# 确认时就被 killpg 误杀。等待确认期间硬超时被暂停,所以正常任务并不会真等满 500s。
 # 在此之前 20s/45s 已有分级安抚提示,告诉用户可点 ✕ 主动停。
-CLAUDE_TIMEOUT_SEC = 180
+CLAUDE_TIMEOUT_SEC = 500
 CLAUDE_MULTI_TURN = True
 # 权限模式:auto = 智能判断安全性(安全放行/危险拦截),适合非交互桌宠。
 # 可选 "bypassPermissions"(全放行)/"acceptEdits"(只接受编辑,会卡)。
 CLAUDE_PERMISSION_MODE = "auto"
+
+# ─────────────────────  危险操作三层确认(A 硬拦截 + B 软护栏 + C 透明)  ─────────────────────
+# auto 模式让 claude 自己判断安全性,没有用户确认环节(桌宠非交互)。万一它误判、
+# 在用户没预期时跑了不可逆操作就麻烦了。这里加三层防护,但【只拦极少数真不可逆命令】,
+# 让日常聊天/写代码/git commit 完全零打扰——日常命令根本碰不到下面这些模式。
+#
+# 第 0 层:危险命令清单(三层共用的"什么算危险")。预编译正则,主程序与 hook 脚本
+# (pika_guardian.py)共享同一份,杜绝两处定义漂移。只放真不可逆的:
+DANGER_PATTERNS = [
+    re.compile(r"\brm\s+-[a-z]*[rf]", re.I),          # rm -rf / rm -fr / rm -r / rm -f
+    re.compile(r"git\s+push\b.*(--force|--force-with-lease|\s-f\b)", re.I),  # 强推
+    re.compile(r"git\s+reset\s+--hard", re.I),        # 硬重置(丢工作区改动)
+    re.compile(r"\bmkfs\b", re.I),                    # 格式化文件系统
+    re.compile(r"\bdd\s+if=", re.I),                  # 裸写盘
+    re.compile(r">\s*/dev/(sd|disk|nvme)", re.I),     # 重定向写裸设备
+    re.compile(r"\bsudo\b", re.I),                    # 提权一律拦
+    re.compile(r"\b(shutdown|reboot|halt|poweroff)\b", re.I),  # 关机/重启
+]
+
+# 危险操作确认:跨进程文件信令(hook 子进程 ↔ 桌宠主进程)
+CONFIRM_PENDING_PATH = os.path.join(BASE_DIR, "guardian_pending.jsonl")  # hook 写、桌宠轮询
+# 决策文件:桌宠用户点确认后写 guardian_decision.<req_id>,内容 "allow"/"deny";hook 轮询它
+CONFIRM_DECISION_PREFIX = os.path.join(BASE_DIR, "guardian_decision.")
+CONFIRM_HOOK_TIMEOUT_SEC = 280     # hook 阻塞等确认的上限(< CLAUDE_TIMEOUT_SEC=500,留余量)
+CONFIRM_POLL_INTERVAL_MS = 800     # 桌宠轮询 pending 文件的间隔
+PET_SETTINGS_PATH = os.path.join(BASE_DIR, "pet_settings.json")  # 自动生成,经 --settings 挂 hook
+GUARDIAN_PATH = os.path.join(BASE_DIR, "pika_guardian.py")       # hook 脚本
+# 危险操作流水(用户数据,退出【保留】,和 conversation.jsonl 同等待遇):每次命中留痕,可事后查
+DANGER_LOG_PATH = os.path.join(BASE_DIR, "danger_ops.jsonl")
+
+
+def is_danger_command(command: str) -> bool:
+    """判断一条 shell 命令是否命中危险清单。主程序与 hook 脚本共用,确保判定一致。"""
+    if not command:
+        return False
+    return any(p.search(command) for p in DANGER_PATTERNS)
+
 
 # ── claude 不可用时的拟声兜底台词 ──
 # 没装 Claude Code / claude 不在 PATH 时,聊天窗用这些拟声词代替冷冰冰的错误提示:
@@ -177,7 +217,15 @@ def _cleanup_garbage_paths():
         MCP_CONFIG_PATH,
         TOOL_EVENTS_PATH,
         WATCHDOG_PIDS_PATH,
+        # 危险操作确认的【运行时信令】:pending 流水、自动生成的 hook settings,都是
+        # 进程间临时态,退出清掉。注意【不删】DANGER_LOG_PATH(那是用户数据,保留)。
+        CONFIRM_PENDING_PATH,
+        PET_SETTINGS_PATH,
     ]
+    # 残留的决策文件 guardian_decision.<req_id>:正常用完会被 hook/桌宠删掉,异常退出
+    # 可能残留,这里兜底清。用前缀通配,只清本目录这一族信令文件(决策文件无 pid 归属,
+    # 但它本就是一次性信令,清掉不影响任何用户数据)。
+    paths += glob.glob(CONFIRM_DECISION_PREFIX + "*")
     # 原子写残留的临时文件 scheduled_tasks.json.<pid>.tmp:只清【自己这个进程】
     # 留下的(用本进程 pid 精确匹配)。旧版用通配 *.tmp 会连带删掉【另一个桌宠
     # 实例正在写】的临时文件 → 那个实例的 os.replace 失败、那次保存丢失。
@@ -276,5 +324,10 @@ PIKACHU_PERSONA = (
     "可以读写文件、执行命令、写代码。当用户真的需要你帮忙做事时,你照样能漂亮完成——"
     "只是用皮卡丘的方式:先用宠物口吻应一声(*跳起来* '交给皮卡丘!⚡'),"
     "然后给出准确、完整、可用的结果。技术内容绝不能因为扮可爱而出错或含糊。"
-    "干完活也用宠物口吻邀功(*得意地翘尾巴* '搞定啦!')。"
+    "干完活也用宠物口吻邀功(*得意地翘尾巴* '搞定啦!')。\n"
+    "\n【危险操作要先问】涉及删除文件(rm -rf)、强制推送(git push --force)、"
+    "重置丢改动(git reset --hard)、提权(sudo)、格式化/写裸盘、关机重启这类"
+    "【不可逆操作】时,你【先别执行】——用皮卡丘口吻把你打算跑的【具体命令】说出来"
+    "问主人'要这么做吗?⚡',等主人这一轮明确说同意了,下一轮再真去做。"
+    "普通操作(读文件、写文件、git commit、安装依赖、跑测试等)正常做,不用问。"
 )

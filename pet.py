@@ -28,12 +28,19 @@ from PyQt6.QtWidgets import (
 
 
 class _ClickBubble(QLabel):
-    """可点击的气泡 QLabel(点击发 clicked 信号)。"""
+    """可点击的气泡 QLabel(左键发 clicked、右键发 rejected)。
+
+    右键 rejected 专给危险操作确认气泡用:左键=放行,右键=立刻拒绝,用户不必干等
+    280s 超时。普通提醒/主动搭话气泡不接 rejected,右键无副作用。
+    """
     clicked = pyqtSignal()
+    rejected = pyqtSignal()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
+        elif event.button() == Qt.MouseButton.RightButton:
+            self.rejected.emit()
         super().mousePressEvent(event)
 
 import ascii_pika
@@ -168,6 +175,16 @@ class PikachuPet(QWidget):
         # 接话题,否则按普通提醒"确认"。用 set 而非单槽:否则第二条主动话题会覆盖
         # 第一条,导致还排在队首的第一条被点击时认不出、当成普通提醒静默关掉、不开窗。
         self._proactive_topics = set()
+        # 危险操作确认:req_id → {"command","ts","bubble"}。hook 拦下危险命令时写 pending,
+        # 桌宠轮询到后冒 sticky 确认气泡并记这里。左键气泡=放行、右键=拒绝、超时自动回收。
+        # 以 req_id 为键(不用气泡文本):长命令截断后前缀可能碰撞,文本作键会互相覆盖。
+        self._pending_confirms = {}
+        # 气泡文本 → req_id 的反查表:_on_bubble_clicked/_rejected 据当前队首文本找 req_id。
+        self._confirm_bubble_to_id = {}
+        # 已冒过泡的危险确认 req_id 集合,按 req_id 去重(防文件截断重读历史行重复冒泡)
+        self._seen_confirm_ids = set()
+        # 确认 pending 文件的轮询游标(仿 _tool_evt_offset/_inode 的半行保护读法)
+        self._confirm_offset, self._confirm_inode = 0, None
         self._t = QElapsedTimer()
         self._t.start()
 
@@ -458,6 +475,7 @@ class PikachuPet(QWidget):
         self.bubble.setWordWrap(True)
         self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.bubble.clicked.connect(self._on_bubble_clicked)
+        self.bubble.rejected.connect(self._on_bubble_rejected)
         self._style_bubble(sticky=False)
         self.bubble.hide()
         self._bubble_sticky = False    # 当前气泡是否常驻(提醒类任务)
@@ -572,9 +590,17 @@ class PikachuPet(QWidget):
     def _on_bubble_clicked(self):
         # 点击 sticky 气泡 = 确认当前这条 → 弹出队列里的下一条(没有则收起)
         if self._bubble_sticky:
+            head = self._sticky_queue[0] if self._sticky_queue else None
+            # 危险操作确认气泡:当前队首是一条待确认 → 左键=放行(allow)。
+            # 优先于主动搭话判断:确认气泡不开聊天窗,只写决策放行那条命令。
+            confirm_req = self._confirm_bubble_to_id.get(head) if head else None
+            if confirm_req is not None:
+                self._last_interact = self._t.elapsed()
+                self._resolve_confirm(confirm_req, "allow")  # 内部出队 + end_await
+                self._flash_state("happy", 1800)
+                return
             # 主动搭话气泡:当前队首正是主动话题 → 点击=展开聊天窗接着聊,
             # 而不是单纯"确认"。先把它出队/收起,再开窗注入开场白。
-            head = self._sticky_queue[0] if self._sticky_queue else None
             is_proactive = head is not None and head in self._proactive_topics
             if self._sticky_queue:
                 self._sticky_queue.pop(0)
@@ -588,6 +614,18 @@ class PikachuPet(QWidget):
                         self._chat.inject_pika_opening(head)
                     except Exception:
                         pass
+
+    def _on_bubble_rejected(self):
+        """右键 sticky 气泡:仅当队首是危险操作确认时=立刻拒绝(deny),不必干等超时。
+        其余气泡右键无副作用(普通提醒/主动搭话不接受右键拒绝)。"""
+        if not self._bubble_sticky:
+            return
+        head = self._sticky_queue[0] if self._sticky_queue else None
+        confirm_req = self._confirm_bubble_to_id.get(head) if head else None
+        if confirm_req is not None:
+            self._last_interact = self._t.elapsed()
+            self._resolve_confirm(confirm_req, "deny")   # 内部出队 + end_await
+            self._flash_state("sad", 1600)
 
     # ---------- 托盘 ----------
     def _build_menu(self):
@@ -646,6 +684,13 @@ class PikachuPet(QWidget):
         self._tool_evt_timer = QTimer(self)
         self._tool_evt_timer.timeout.connect(self._check_tool_events)
         self._tool_evt_timer.start(1500)
+
+        # 危险操作确认轮询(A 层):hook 拦下危险命令后写 pending,桌宠轮询到 → 冒 sticky
+        # 确认气泡 + 暂停硬超时。同样只处理启动后新增的行,(offset, inode) 半行保护。
+        self._confirm_offset, self._confirm_inode = self._confirm_stat()
+        self._confirm_timer = QTimer(self)
+        self._confirm_timer.timeout.connect(self._check_pending_confirms)
+        self._confirm_timer.start(config.CONFIRM_POLL_INTERVAL_MS)
 
         # E1 首次引导:第一次运行时,延迟冒一个"双击我聊天"的常驻气泡,
         # 让新用户发现核心功能(单击只逗一下,不开聊天,容易以为没反应)。
@@ -896,6 +941,167 @@ class PikachuPet(QWidget):
                 desc = evt.get("desc", "提醒")
                 self._set_state("happy", 1800)
                 self.show_bubble(f"✅ 已记下「{desc[:14]}」", sticky=True)
+
+    @staticmethod
+    def _confirm_stat():
+        """返回危险操作 pending 文件的 (size, inode);不存在返回 (0, None)。"""
+        try:
+            st = os.stat(config.CONFIRM_PENDING_PATH)
+            return st.st_size, st.st_ino
+        except OSError:
+            return 0, None
+
+    def _check_pending_confirms(self):
+        """轮询危险操作 pending 文件(A 层):hook 拦下危险命令 → 冒 sticky 确认气泡。
+
+        发现待确认项时:① 暂停 claude 硬超时(begin_await,让 hook 慢慢等用户)
+        ② 把命令做成皮卡丘口吻的确认气泡 ③ 记 req_id 供点击/右键/超时回收。
+        每轮先做【超时回收】:hook 那边 280s 没等到点击会自己 deny 退出,桌宠侧若没人
+        点击就永远挂着气泡 + 不递减 await 计数 → 硬超时被永久暂停(致命 bug)。所以每轮
+        清理已超时的待确认项:移气泡、冒一句安抚、end_await。半行保护 + (offset,inode)。
+        """
+        self._sweep_expired_confirms()
+        path = config.CONFIRM_PENDING_PATH
+        try:
+            size, inode = self._confirm_stat()
+            if inode is None:
+                return
+            if inode != self._confirm_inode or size < self._confirm_offset:
+                self._confirm_offset = 0
+                self._confirm_inode = inode
+            if size == self._confirm_offset:
+                return
+            with open(path, "rb") as f:
+                f.seek(self._confirm_offset)
+                chunk = f.read()
+            nl = chunk.rfind(b"\n")
+            if nl == -1:
+                return
+            complete = chunk[:nl + 1]
+            self._confirm_offset += len(complete)
+            new_lines = complete.decode("utf-8", "replace").splitlines()
+        except Exception:
+            return
+
+        import json as _json
+        for line in new_lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = _json.loads(line)
+            except Exception:
+                continue
+            req_id = evt.get("id")
+            command = (evt.get("command") or "").strip()
+            if not req_id or not command:
+                continue
+            # hook 写 pending 时的时刻 = hook 280s 倒计时的起点(不是桌宠现在显示气泡
+            # 的时刻)。超时回收要按这个判,否则桌宠轮询晚了会算晚、漏过 hook 的真超时。
+            hook_ts = evt.get("ts")
+            if not isinstance(hook_ts, (int, float)):
+                hook_ts = time.time()
+            # 同一 req_id 只处理一次(offset 游标已防重读,这是防文件截断重读的二道保险)
+            if req_id in self._seen_confirm_ids:
+                continue
+            self._seen_confirm_ids.add(req_id)
+            # ① 暂停硬超时:hook 此刻正阻塞等确认,告诉 claude_bridge 别让它超时被杀。
+            #    用计数器 begin_await:多条并发待确认各登记一次,全部结束才恢复倒计时。
+            try:
+                claude_bridge.begin_await()
+            except Exception:
+                pass
+            # ② 冒确认气泡。命令带中文动词解释 + 截断显示;文案明确"放行此操作",和
+            #    普通提醒"点我看下一条"区分开,避免用户在翻阅时误点放行(队列混淆)。
+            verb = self._danger_verb(command)
+            shown = command if len(command) <= 44 else command[:44] + "…"
+            bubble = (
+                f"⚠️ 皮卡丘要{verb}「{shown}」—— 不可逆操作!\n"
+                f"左键=放行此操作 ✓  右键=不做 ✕"
+            )
+            self._pending_confirms[req_id] = {
+                "command": command, "ts": hook_ts, "bubble": bubble,
+            }
+            self._confirm_bubble_to_id[bubble] = req_id
+            self._flash_state("surprise", 1600)
+            # 危险确认插到 sticky 队首:不让它排在普通提醒后面被"看下一条"误点放行。
+            self._show_confirm_bubble(bubble)
+
+    @staticmethod
+    def _danger_verb(command):
+        """从命令猜一个中文动词,让小白也能感知这次操作在干嘛(看不懂 rm -rf 也知道是删)。"""
+        c = command.lower()
+        if "rm " in c or c.startswith("rm"):
+            return "删除"
+        if "git push" in c:
+            return "强制推送"
+        if "reset --hard" in c:
+            return "重置丢弃改动"
+        if "sudo" in c:
+            return "用管理员权限运行"
+        if "mkfs" in c or "dd if=" in c or "/dev/" in c:
+            return "写磁盘/格式化"
+        if any(w in c for w in ("shutdown", "reboot", "halt", "poweroff")):
+            return "关机/重启"
+        return "执行"
+
+    def _show_confirm_bubble(self, bubble):
+        """把危险确认气泡插到 sticky 队首并立即显示(优先于普通提醒,防误点)。"""
+        # 已在队列(同文本)就不重复插
+        if bubble in self._sticky_queue:
+            self._refresh_sticky_text()
+            return
+        self._sticky_queue.insert(0, bubble)
+        # 超出上限时丢【队尾】(普通提醒),保住刚插到队首的危险确认
+        if len(self._sticky_queue) > config.STICKY_QUEUE_MAX:
+            del self._sticky_queue[-1]
+        # 强制把队首这条危险确认显示出来(无论当前在显示哪条)
+        self._bubble_sticky = True
+        self._render_bubble(self._sticky_text(), sticky=True)
+
+    def _sweep_expired_confirms(self):
+        """回收已超时的待确认项:hook 那边 280s 会自己 deny 退出,桌宠侧据此清理,
+        否则气泡永挂 + await 计数不归零 → 硬超时被永久暂停。"""
+        if not self._pending_confirms:
+            return
+        now = time.time()
+        # 留 15s 缓冲,确保 hook 那边(CONFIRM_HOOK_TIMEOUT_SEC=280)确实已超时退出
+        limit = config.CONFIRM_HOOK_TIMEOUT_SEC + 15
+        expired = [rid for rid, info in self._pending_confirms.items()
+                   if now - info.get("ts", now) > limit]
+        for rid in expired:
+            self._remove_confirm(rid)
+        if expired:
+            # 已超时 → hook 早自动 deny 了,告诉用户一声(普通气泡,会自动消失)
+            self.show_bubble("*耳朵耷拉* 等太久啦,那个操作皮卡丘先没做哦~", sticky=False)
+
+    def _remove_confirm(self, req_id):
+        """从所有结构里移除一条待确认 + 出队气泡 + 递减 await 计数。决策由调用方先写。"""
+        info = self._pending_confirms.pop(req_id, None)
+        if info is None:
+            return
+        bubble = info.get("bubble")
+        self._confirm_bubble_to_id.pop(bubble, None)
+        if bubble in self._sticky_queue:
+            self._sticky_queue.remove(bubble)
+        # 当前正显示的就是这条 → 刷新到下一条(或收起)
+        self._show_next_sticky()
+        try:
+            claude_bridge.end_await()   # 这条不再等人,递减计数(归零才恢复硬超时)
+        except Exception:
+            pass
+
+    def _resolve_confirm(self, req_id, decision):
+        """写危险操作决策文件(allow/deny)→ hook 轮询到后据此放行/拒绝 → 清理本条。"""
+        try:
+            tmp = f"{config.CONFIRM_DECISION_PREFIX}{req_id}.tmp"
+            final = f"{config.CONFIRM_DECISION_PREFIX}{req_id}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(decision)
+            os.replace(tmp, final)   # 原子写,hook 不会读到半截
+        except Exception:
+            pass
+        self._remove_confirm(req_id)
 
     def _flash_state(self, state, dur):
         """到点时短暂切个情绪态;但聊天正在等 claude(思考态)时不打断它。
@@ -1390,6 +1596,12 @@ class PikachuPet(QWidget):
         「QThread: Destroyed while thread is still running」甚至 abort,
         且底层 claude 子进程会变成孤儿。cancel 会 kill 子进程,wait 等线程收尾。
         """
+        # 清零危险操作确认的硬超时暂停计数:退出时不再等任何人点确认,让仍在等的
+        # claude 调用恢复正常超时/被下面的 cancel+killpg 干净杀掉(连 hook 子进程)。
+        try:
+            claude_bridge.reset_await()
+        except Exception:
+            pass
         workers = list(self._sched_workers)
         # 后台记忆整理 worker 也要一并 cancel + join:否则退出时它仍在跑 →
         # 「QThread: Destroyed while thread is still running」+ claude 子进程变孤儿。

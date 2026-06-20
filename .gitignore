@@ -20,6 +20,13 @@ scheduled_tasks.json
 tool_events.jsonl
 # claude_bridge._ensure_mcp_config() 自动生成
 mcp_config.json
+# 危险操作确认:hook settings 自动生成 + pending 流水 + 决策信令(均为运行时态)
+pet_settings.json
+pet_settings.json.*.tmp
+guardian_pending.jsonl
+guardian_decision.*
+# 危险操作流水(用户数据):每次危险命令的 pending/allow/deny 留痕。退出保留、不入库。
+danger_ops.jsonl
 # 锁文件 / 原子写残留临时文件
 scheduled_tasks.json.lock
 scheduled_tasks.json.*.tmp
