@@ -198,6 +198,9 @@ class ChatWindow(QWidget):
         self._thinking_time = None
         self._pending_user = ""
         self._history = []
+        # claude 不可用降级时,只在【本窗口首次】降级带完整提示(那句很长,解释要装
+        # Claude Code);之后只回纯拟声词,免得连发多条被同一句长提示刷屏。
+        self._babbled_hint = False
         # 桌宠本体回调:快通道本地建任务后冒"已记下"确认气泡(与 MCP 路径一致)。
         # 由 pet.open_chat 创建本窗口后注入;为 None 时不影响聊天功能。
         self.on_local_schedule = None
@@ -468,6 +471,20 @@ class ChatWindow(QWidget):
         self._add("你", text)
         # 先看是不是在管理定时任务(列出/删除/新建),命中就本地处理,不发 claude
         if self._handle_schedule_command(text):
+            return
+        # claude 不可用(没装 Claude Code / 不在 PATH):不起注定失败的 worker,
+        # 皮卡丘改用拟声台词"出声"回应——既给即时反馈,又温和点明原因。复用
+        # _say_local(进历史 + 落记忆流水,与正常一轮一致),不进 thinking 态、
+        # 无超时等待。放在 schedule 判断【之后】:没装 claude 时本地定时命令仍可用。
+        if not claude_bridge.claude_available():
+            babble = random.choice(config.PIKA_BABBLE)
+            # 首次降级带完整提示(解释要装 Claude Code),之后只回纯拟声词,不刷屏。
+            if not self._babbled_hint:
+                self._babbled_hint = True
+                pika = f"{babble}\n\n{config.PIKA_NO_CLAUDE_HINT}"
+            else:
+                pika = babble
+            self._say_local(text, pika)
             return
         self._thinking = self._add_thinking()
         self._busy(True)

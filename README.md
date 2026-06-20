@@ -73,6 +73,12 @@
 #### 🌟 电影级特效层
 走路扬尘 `·˙·`、放电边缘光晕、情绪粒子 ✨/💧 飘动 —— 全部可一键开关。
 
+#### 🧩 记忆碎片 · 越处越熟
+后台每隔半小时悄悄整理你们的对话,把「你在学黄金 ETF」「那个脚本还没写」这类有价值的事记成长期记忆,聊天时自然带出来 —— 处得越久越懂你。
+
+#### 🗨️ 主动搭话
+发现值得聊的话题(没做完的事 / 作息关怀 / 兴趣延续 / 纯陪伴),会主动冒个气泡找你;点一下就接着这个话题开聊。
+
 #### 🖥️ 全桌面常驻
 浮在所有 Space / 全屏 App 之上,不进 Dock,托盘随时召唤或退出。
 
@@ -164,6 +170,31 @@ python pet.py
 
 ---
 
+## 🧩 记忆碎片 & 主动搭话
+
+让皮卡丘**慢慢越来越熟悉你**,而不是每次都当陌生人。
+
+```
+每轮对话 ─→ conversation.jsonl(流水)
+                  │  (后台每 30 分钟轮询一次,无新对话则跳过,零开销)
+                  ↓
+            claude 整理提炼 ─→ memory.json(机器主存)+ memory.md(人类可读)
+                  │             记忆带时间锚点、权重老化、超量淘汰、近似去重
+                  ├─→ 聊天时注入高权重记忆 → 皮卡丘「记得」你
+                  └─→ 发现值得聊的话题 → 本体冒气泡主动搭话(频率门把关)
+```
+
+- **整理** — 后台 QThread 调 claude **纯文本推理**,不阻塞界面;**这段时间没新对话就整段跳过**,不空跑。
+- **记忆会老化** — 每条记忆按天衰减权重,长期没提及的低权重记忆自动淘汰,防无限膨胀;再被提到则权重回升。
+- **主动搭话有分寸** — 五重本地频率门:静默时段(默认 23:00–08:00)不打扰、你刚操作过不打断、两次间隔/每日上限都受限。claude 只「提议」话题,**要不要真打扰由本地把关**。
+- **四类搭话依据** — ① 没做完的事 ② 时间/作息关怀 ③ 兴趣话题延续 ④ 纯陪伴。
+
+记忆数据(`memory.json` / `memory.md` / `conversation.jsonl`)都是**你的私人数据**,不入库、退出保留。整套存储引擎在 [`memory.py`](memory.py),沿用定时任务同款 flock 跨进程锁 + 原子写。
+
+> **没装 Claude Code 也不崩** — 此时皮卡丘聊天会用拟声词回你(「皮卡皮卡~⚡」)并温和提示去装 Claude Code,后台整理/主动搭话自动跳过、不空转。装好重启即恢复全部能力。
+
+---
+
 ## 🎛️ 调教手册
 
 全在 **[`config.py`](config.py)**,挑几个常用的:
@@ -178,6 +209,12 @@ PLAY_WEIGHTS         = {...}    # 自主玩耍各动作权重
 FX_DUST_ENABLED      = True     # 走路扬尘
 FX_GLOW_ENABLED      = True     # 放电光晕
 FX_MOOD_ENABLED      = True     # 情绪粒子 ✨/💧
+
+MEMORY_ENABLED       = True     # 记忆碎片总开关
+DIGEST_INTERVAL_MS   = 1800000  # 后台整理间隔(默认 30 分钟)
+PROACTIVE_ENABLED    = True     # 主动搭话总开关
+PROACTIVE_MAX_PER_DAY = 6       # 主动搭话每日上限(活泼;想克制调小)
+PROACTIVE_QUIET_HOURS = (23, 8) # 静默时段,夜里不主动打扰
 
 CLAUDE_WORKDIR       = "~/Desktop/Claude-Code"   # 干活目录
 CLAUDE_PERMISSION_MODE = "auto"                  # 权限模式
@@ -196,6 +233,7 @@ pikachu-pet/
 ├── macos_window.py   # macOS 全 Space 常驻窗口层级
 ├── scheduler.py      # 定时任务存储 / 触发 / 自然语言后备解析
 ├── pika_mcp.py       # MCP server:schedule / list / delete 工具
+├── memory.py         # 记忆碎片引擎:对话流水 / 记忆库 / 老化淘汰 / md 导出
 ├── config.py         # 集中配置
 └── requirements.txt  # PyQt6 + mcp
 ```
@@ -207,7 +245,7 @@ pikachu-pet/
 | 症状 | 解法 |
 |:--|:--|
 | 皮卡丘不出现 | `pip install -r requirements.txt`,看终端报错 |
-| 聊天报「找不到 claude」 | `which claude` 确认已装并登录 |
+| 皮卡丘只会「皮卡皮卡」不好好说话 | 没装 / 没登录 Claude Code,`which claude` 确认后装好重启 |
 | 回复很慢 | 复杂任务本就耗时,皮卡丘会同步挠头思考 |
 | 字符/特效错位 | `⚡✨ω♪☁💧` 等宽字符可能略溢格,调 `ASCII_FONT_PX` |
 | 想换干活目录 | 改 `config.py` 的 `CLAUDE_WORKDIR` |

@@ -623,15 +623,28 @@ class PikachuPet(QWidget):
 
         # E1 首次引导:第一次运行时,延迟冒一个"双击我聊天"的常驻气泡,
         # 让新用户发现核心功能(单击只逗一下,不开聊天,容易以为没反应)。
-        if not os.path.exists(config.FIRST_RUN_FLAG):
+        # 但【没装 claude 时跳过】:那条引导说"双击我聊天"会误导(此刻聊不了),
+        # 且会和下面的 no-claude 提示气泡同时入队两条 sticky。没装 claude 时只弹
+        # no-claude 提示这一条,引导留到用户装好 claude 后的下次首启再弹。
+        if not os.path.exists(config.FIRST_RUN_FLAG) and claude_bridge.claude_available():
             QTimer.singleShot(config.ONBOARD_DELAY_MS, self._maybe_onboard)
 
         # 记忆整理 + 主动搭话:每 DIGEST_INTERVAL_MS 轮询一次。无新对话则跳过
         # (零 claude 调用)。整理在后台 QThread 跑,完成后回主线程落盘 + 可能搭话。
-        if config.MEMORY_ENABLED:
+        # 叠加 claude 可用性 gate:没装 Claude Code 时整理注定失败,干脆不起 timer——
+        # 否则每 30 分钟(有新对话时)空转一个注定失败的子进程。主动搭话依赖整理
+        # 产出话题,timer 不起 → 自然也不会主动搭话,无需额外处理。
+        if config.MEMORY_ENABLED and claude_bridge.claude_available():
             self._digest_timer = QTimer(self)
             self._digest_timer.timeout.connect(self._check_memory)
             self._digest_timer.start(config.DIGEST_INTERVAL_MS)
+
+        # claude 不可用时:延迟冒一个一次性提示气泡,免得用户看皮卡丘能动就
+        # 以为一切正常、直到第一次聊天才撞见说不了话。用实例属性去重(不写持久
+        # 标记文件:每次启动都该按"当前是否装了 claude"重新判断,不被旧标记压制)。
+        self._no_claude_warned = False
+        if not claude_bridge.claude_available():
+            QTimer.singleShot(config.ONBOARD_DELAY_MS, self._warn_no_claude)
 
     def _maybe_onboard(self):
         """首次引导气泡(只弹一次,靠标记文件去重)。"""
@@ -646,6 +659,18 @@ class PikachuPet(QWidget):
         # 引导时本体开心放电一下,更显眼;sticky 气泡点击才消失,确保用户看到。
         self._flash_state("happy", 2200)
         self.show_bubble(config.ONBOARD_HINT, sticky=True)
+
+    def _warn_no_claude(self):
+        """claude 不可用时的一次性提示气泡(本会话只冒一次)。
+
+        用拟声 + 温和说明告诉用户需要装 Claude Code,皮卡丘做"说不了话"的微表情。
+        sticky 确保用户看到;实例属性去重,避免被其他路径重复触发。
+        """
+        if self._no_claude_warned:
+            return
+        self._no_claude_warned = True
+        self._flash_state("sad", 2200)
+        self.show_bubble(config.PIKA_NO_CLAUDE_HINT, sticky=True)
 
     def _on_anim(self):
         self._frame += 1

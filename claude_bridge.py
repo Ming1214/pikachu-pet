@@ -12,6 +12,7 @@
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -23,6 +24,35 @@ import config
 
 class ClaudeError(Exception):
     """claude 调用失败时抛出,聊天窗据此显示友好兜底文案。"""
+
+
+# claude CLI 是否在 PATH 的进程内缓存:None=未检测,True/False=已知结果。
+# 缓存避免每次发消息都走一遍 shutil.which(查 PATH 是系统调用);代价是用户
+# 运行期间才装好 claude 需重启(或调 invalidate_claude_cache)才生效——可接受。
+_claude_ok_cache = None
+
+
+def claude_available() -> bool:
+    """检测 claude CLI 是否可用(只查 PATH 是否存在该命令,轻量、带缓存)。
+
+    故意【不】实际跑 `claude --version`:那会起子进程、慢,且本函数会在聊天
+    热路径(每次发消息前)被调用,必须廉价。只判断"命令存不存在"已足够区分
+    "没装 Claude Code"这一最常见的不可用场景;真正运行期报错仍由 ask_* 内部
+    的 ClaudeError 兜底。任何异常都按"可用"处理,绝不因探测本身挡住聊天。
+    """
+    global _claude_ok_cache
+    if _claude_ok_cache is None:
+        try:
+            _claude_ok_cache = shutil.which(config.CLAUDE_BIN) is not None
+        except Exception:
+            _claude_ok_cache = True      # 探测失败不该误判为不可用,放行给后续调用
+    return _claude_ok_cache
+
+
+def invalidate_claude_cache() -> None:
+    """清掉可用性缓存:用户中途装好 claude 后可据此复检(暂留作手动/重启复检用)。"""
+    global _claude_ok_cache
+    _claude_ok_cache = None
 
 
 def _register_proc(proc: subprocess.Popen):

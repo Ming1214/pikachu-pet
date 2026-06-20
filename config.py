@@ -130,6 +130,21 @@ CLAUDE_MULTI_TURN = True
 # 可选 "bypassPermissions"(全放行)/"acceptEdits"(只接受编辑,会卡)。
 CLAUDE_PERMISSION_MODE = "auto"
 
+# ── claude 不可用时的拟声兜底台词 ──
+# 没装 Claude Code / claude 不在 PATH 时,聊天窗用这些拟声词代替冷冰冰的错误提示:
+# 既给用户即时反馈("皮卡丘出声了"),又不至于吓到人。从池里随机挑一句,每次不同。
+PIKA_BABBLE = [
+    "皮卡皮卡~⚡",
+    "皮卡丘?(歪头)皮卡…皮卡…",
+    "皮卡皮卡!(指了指你)皮——卡——丘!",
+    "(蹭蹭你)皮卡~ 皮卡丘…",
+]
+# 拟声词后再拼这句,温和点明"说不了完整的话"的原因,免得用户一头雾水。
+PIKA_NO_CLAUDE_HINT = (
+    "皮卡皮卡…⚡(皮卡丘只会冒电火花了——好像还没装好 Claude Code,"
+    "装好它皮卡丘才能好好和你说话哦~)"
+)
+
 # ── 定时任务 MCP 工具(让 claude 自主判断要不要建/查/删定时任务)──
 MCP_SERVER_PATH = os.path.join(BASE_DIR, "pika_mcp.py")
 MCP_CONFIG_PATH = os.path.join(BASE_DIR, "mcp_config.json")  # 自动生成
