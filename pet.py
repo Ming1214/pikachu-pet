@@ -1323,6 +1323,13 @@ class PikachuPet(QWidget):
             # 纯提醒:冒一个常驻、醒目的气泡,点击才消失(=你确认了)
             self._flash_state("happy", 2200)
             self.show_bubble(f"⚡ 该「{desc[:16]}」啦!", sticky=True)
+            # 同时往聊天窗补一条皮卡丘口吻的提醒记录:用户常在聊天窗里建提醒,
+            # 到点却只在本体冒气泡、聊天窗空白(体验断层)。本地拼模板、不调 claude,
+            # 走互锁:聊天窗开着且空闲就直接写,否则暂存等空了/重开窗补写。
+            from datetime import datetime as _dt
+            line = (f"*蹦到你面前* {desc[:24]} 时间到啦!皮卡有叫你哦~ ⚡"
+                    f"({_dt.now().strftime('%H:%M')})")
+            self._deliver_to_chat(line)
             return
 
         # 执行类:调 claude 真去干活
@@ -1389,20 +1396,24 @@ class PikachuPet(QWidget):
         full = f"⏰ 定时任务「{desc}」\n{reply}"
         # E2 + 互锁:聊天窗开着且空闲才直接写;正忙(有用户对话在跑)或没开则
         # 暂存,等空了/重开窗补写,避免和用户那条对话的回复交错成两条。
-        if self._chat_can_write_now():
-            self._chat._add("皮卡", full)
-        else:
-            self._stash_result(full)
+        self._deliver_to_chat(full)
 
     def _on_sched_fail(self, task, err):
         self._flash_state("sad", 2600)     # 任务失败:耷拉耳朵沮丧(思考中不打断)
         desc = task.get("desc", "")
         self.show_bubble(f"⚠️ 没做成「{desc[:10]}」(双击我看详情)", sticky=True)
-        full = f"*耷拉耳朵* 「{desc}」没做成…{err[:80]}"
+        self._deliver_to_chat(f"*耷拉耳朵* 「{desc}」没做成…{err[:80]}")
+
+    def _deliver_to_chat(self, text):
+        """把一条定时任务消息(提醒/完成/失败)送进聊天窗,带互锁:聊天窗开着且
+        空闲就直接写,否则暂存(等聊天空了 / open_chat / _exit_thinking 时补写)。
+
+        统一三处调用(reminder 到点、_on_sched_done、_on_sched_fail)的写入语义,
+        避免各写一份导致互锁逻辑漂移。"""
         if self._chat_can_write_now():
-            self._chat._add("皮卡", full)
+            self._chat._add("皮卡", text)
         else:
-            self._stash_result(full)
+            self._stash_result(text)
 
     def _stash_result(self, text):
         """暂存一条定时任务结果,等聊天窗打开时补写。上限 10 条,超出丢最旧。"""
