@@ -23,15 +23,17 @@ from PyQt6.QtGui import (
     QAction, QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QLabel, QMenu, QSystemTrayIcon, QWidget,
+    QApplication, QHBoxLayout, QLabel, QMenu, QPushButton, QSystemTrayIcon,
+    QVBoxLayout, QWidget,
 )
 
 
 class _ClickBubble(QLabel):
     """可点击的气泡 QLabel(左键发 clicked、右键发 rejected)。
 
-    右键 rejected 专给危险操作确认气泡用:左键=放行,右键=立刻拒绝,用户不必干等
-    280s 超时。普通提醒/主动搭话气泡不接 rejected,右键无副作用。
+    用于普通定时提醒 / 主动搭话气泡:左键=确认/展开下一条。rejected(右键)现已
+    无用——危险操作确认改用独立的两按钮浮层 _ConfirmBubble(见下),不再靠右键拒绝
+    (Mac 触控板没有方便的右键)。保留 rejected 信号只为兼容连接,槽里不做任何事。
     """
     clicked = pyqtSignal()
     rejected = pyqtSignal()
@@ -42,6 +44,70 @@ class _ClickBubble(QLabel):
         elif event.button() == Qt.MouseButton.RightButton:
             self.rejected.emit()
         super().mousePressEvent(event)
+
+
+class _ConfirmBubble(QWidget):
+    """危险操作确认气泡:警示文字 + 两个【左键单击】按钮(✕ 不做 / ✓ 放行)。
+
+    为什么不复用 _ClickBubble 的"左键放行/右键拒绝":Mac 触控板没有方便的右键
+    (默认轻点=左键),右键拒绝入口几乎用不了,而误触左键就直接放行最危险的操作——
+    安全方向被反置了。改成气泡内嵌两个独立可点区域,放行/拒绝都用左键单击,谁也
+    不依赖右键;且两个按钮分开摆放、文案明确,误点概率最低。
+
+    与普通提醒气泡(_ClickBubble + sticky 队列)完全解耦:它是叠在本体上方的独立
+    overlay,不进 _sticky_queue,从根本上杜绝"翻阅普通提醒时误点放行"的队列混淆。
+    """
+    allowed = pyqtSignal()
+    denied = pyqtSignal()
+
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        # 整块红底圆角警示框(沿用 sticky 提醒的醒目红,区别于普通黄气泡)
+        self.setStyleSheet(
+            "background: rgba(238,21,21,240); border:2px solid #FFE259;"
+            "border-radius:12px;")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 10)
+        lay.setSpacing(8)
+
+        self._label = QLabel(text, self)
+        self._label.setWordWrap(True)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setStyleSheet(
+            "background: transparent; color:#FFFFFF; font-size:13px;"
+            f"font-weight:bold; font-family:{config.FONT_STACK};")
+        lay.addWidget(self._label)
+
+        row = QHBoxLayout()
+        row.setSpacing(16)   # 两按钮间距拉大,触控板轻点不易误点到隔壁
+        # 安全方向(不做)放左 + 做成【实色醒目】主按钮;放行放右 + 做成【次要/低调】
+        # 样式。这样安全方向既在更顺手的左侧、视觉权重也最高,引导用户优先点"不做";
+        # "放行"刻意低调,需要用户多看一眼、确认意图才点。两个都是左键单击,触控板无障碍。
+        self._deny_btn = QPushButton("✕ 不做", self)
+        self._allow_btn = QPushButton("✓ 放行", self)
+        for btn, fg, bg, bghover, border in (
+            # 不做 = 实色亮黄主按钮(深字),最醒目
+            (self._deny_btn, "#1C1E2C", "#FFE259", "#FFEC8B", "rgba(255,255,255,200)"),
+            # 放行 = 半透明次要按钮(白字),低调
+            (self._allow_btn, "#FFFFFF", "rgba(255,255,255,28)", "rgba(255,255,255,55)",
+             "rgba(255,255,255,120)"),
+        ):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(
+                f"QPushButton {{ color:{fg}; background:{bg};"
+                f"border:1.5px solid {border}; border-radius:9px;"
+                f"padding:7px 16px; font-size:13px; font-weight:bold;"
+                f"font-family:{config.FONT_STACK}; }}"
+                f"QPushButton:hover {{ background:{bghover}; }}")
+        # clicked 会带一个 bool(checked)实参,而 denied/allowed 是无参信号,
+        # 直接 connect(self.denied.emit) 会把 bool 塞进 emit() 报错;用 lambda 吞掉。
+        self._deny_btn.clicked.connect(lambda: self.denied.emit())
+        self._allow_btn.clicked.connect(lambda: self.allowed.emit())
+        row.addWidget(self._deny_btn)
+        row.addWidget(self._allow_btn)
+        lay.addLayout(row)
+        self.hide()
+
 
 import ascii_pika
 import claude_bridge
@@ -137,9 +203,11 @@ def ensure_avatar():
 # ════════════════════════  桌宠窗口  ════════════════════════
 class PikachuPet(QWidget):
     PAD = 24  # 窗口内边距(给气泡/电花留空间)
-    # 顶部预留给气泡的高度:多行气泡(首次引导那条 3~4 行)约需 100px。
+    # 顶部预留给气泡的高度:多行气泡(首次引导那条 3~4 行)约需 100px;危险确认
+    # 两按钮浮层(文字 3 行折行 + 一排按钮)最高约 142px(长命令换 4 行时)。取 150
+    # 留点余量,确保浮层完整显示、不压到皮卡丘头顶。
     # 设为类属性,确保 paintEvent / _spawn_mood 任何时候取到的都一致。
-    BUBBLE_TOP_RESERVE = 120
+    BUBBLE_TOP_RESERVE = 150
 
     def __init__(self):
         super().__init__()
@@ -175,12 +243,16 @@ class PikachuPet(QWidget):
         # 接话题,否则按普通提醒"确认"。用 set 而非单槽:否则第二条主动话题会覆盖
         # 第一条,导致还排在队首的第一条被点击时认不出、当成普通提醒静默关掉、不开窗。
         self._proactive_topics = set()
-        # 危险操作确认:req_id → {"command","ts","bubble"}。hook 拦下危险命令时写 pending,
-        # 桌宠轮询到后冒 sticky 确认气泡并记这里。左键气泡=放行、右键=拒绝、超时自动回收。
-        # 以 req_id 为键(不用气泡文本):长命令截断后前缀可能碰撞,文本作键会互相覆盖。
+        # 危险操作确认:req_id → {"command","ts","widget"}。hook 拦下危险命令时写 pending,
+        # 桌宠轮询到后冒一个【两按钮确认 overlay】(_ConfirmBubble)并记这里。两个按钮都是
+        # 左键单击(✓ 放行 / ✕ 不做),不依赖右键——Mac 触控板也能稳点;超时自动回收。
+        # 以 req_id 为键:长命令截断后前缀可能碰撞,文本作键会互相覆盖。
         self._pending_confirms = {}
-        # 气泡文本 → req_id 的反查表:_on_bubble_clicked/_rejected 据当前队首文本找 req_id。
-        self._confirm_bubble_to_id = {}
+        # 待显示的确认 req_id 顺序队列:同一时刻只显示一个 overlay(最早进的先处理),
+        # 处理完(放行/拒绝/超时)再显示下一个。避免多个 overlay 叠在一起互相遮挡。
+        self._confirm_order = []
+        # 当前正显示的确认 req_id(None=没有)。决策/回收据此找对应 overlay。
+        self._active_confirm = None
         # 已冒过泡的危险确认 req_id 集合,按 req_id 去重(防文件截断重读历史行重复冒泡)
         self._seen_confirm_ids = set()
         # 确认 pending 文件的轮询游标(仿 _tool_evt_offset/_inode 的半行保护读法)
@@ -533,13 +605,28 @@ class PikachuPet(QWidget):
 
     BUBBLE_MAX_W = 260   # 气泡最大宽度(超出则换行;放宽些让长引导文案行数更少)
 
+    def _confirm_active(self):
+        """当前是否有危险确认浮层正在显示(或排队待显示)。
+
+        危险确认浮层和普通气泡都摆在窗口顶部 y=2 居中、是兄弟 widget——同时显示会
+        空间重叠 + raise_ 互抢,导致确认按钮被普通提醒盖住、用户点不到(而 hook 仍在
+        280s 等确认)。所以确认浮层活跃期间,普通气泡一律【不渲染、只入队】,等浮层
+        全部处理完再 flush 出来。判据:有 active 浮层,或队列里还有待显示的确认。
+        """
+        return self._active_confirm is not None or bool(self._confirm_order)
+
     def _render_bubble(self, display, sticky):
         """实际把文字画到气泡上(尺寸/定位/样式)。
 
         关键:WordWrap 的 QLabel 在限宽后,adjustSize() 常按单行高算,导致多行
         文本被裁(上下截断)。必须用 heightForWidth 显式把高度撑到换行后的真实
         行数,长气泡(如首次引导那条)才不会被切掉头尾。
+
+        危险确认浮层活跃时,本方法【直接返回不渲染】(把顶部让给确认浮层)。sticky
+        提醒此前已入队、不会丢;非 sticky 走路气泡可丢弃。浮层处理完会 flush 队列。
         """
+        if self._confirm_active():
+            return
         self._bubble_sticky = sticky
         self._style_bubble(sticky)
         self.bubble.setText(display)
@@ -589,16 +676,10 @@ class PikachuPet(QWidget):
 
     def _on_bubble_clicked(self):
         # 点击 sticky 气泡 = 确认当前这条 → 弹出队列里的下一条(没有则收起)
+        # 注:危险操作确认已不走 sticky 队列,改用独立的两按钮 overlay(_ConfirmBubble),
+        # 故这里不再有"确认放行"分支——普通提醒/主动搭话气泡才走到这。
         if self._bubble_sticky:
             head = self._sticky_queue[0] if self._sticky_queue else None
-            # 危险操作确认气泡:当前队首是一条待确认 → 左键=放行(allow)。
-            # 优先于主动搭话判断:确认气泡不开聊天窗,只写决策放行那条命令。
-            confirm_req = self._confirm_bubble_to_id.get(head) if head else None
-            if confirm_req is not None:
-                self._last_interact = self._t.elapsed()
-                self._resolve_confirm(confirm_req, "allow")  # 内部出队 + end_await
-                self._flash_state("happy", 1800)
-                return
             # 主动搭话气泡:当前队首正是主动话题 → 点击=展开聊天窗接着聊,
             # 而不是单纯"确认"。先把它出队/收起,再开窗注入开场白。
             is_proactive = head is not None and head in self._proactive_topics
@@ -616,16 +697,12 @@ class PikachuPet(QWidget):
                         pass
 
     def _on_bubble_rejected(self):
-        """右键 sticky 气泡:仅当队首是危险操作确认时=立刻拒绝(deny),不必干等超时。
-        其余气泡右键无副作用(普通提醒/主动搭话不接受右键拒绝)。"""
-        if not self._bubble_sticky:
-            return
-        head = self._sticky_queue[0] if self._sticky_queue else None
-        confirm_req = self._confirm_bubble_to_id.get(head) if head else None
-        if confirm_req is not None:
-            self._last_interact = self._t.elapsed()
-            self._resolve_confirm(confirm_req, "deny")   # 内部出队 + end_await
-            self._flash_state("sad", 1600)
+        """普通 sticky 气泡的右键:现已无副作用。
+
+        危险操作确认改用独立的两按钮 overlay(✕ 不做 = 左键单击),不再靠右键拒绝
+        ——Mac 触控板没有方便的右键,右键拒绝入口形同虚设。保留本槽是因 _ClickBubble
+        仍连着 rejected 信号;此处不做任何事,避免右键普通提醒产生意外行为。"""
+        return
 
     # ---------- 托盘 ----------
     def _build_menu(self):
@@ -1011,21 +1088,55 @@ class PikachuPet(QWidget):
                 claude_bridge.begin_await()
             except Exception:
                 pass
-            # ② 冒确认气泡。命令带中文动词解释 + 截断显示;文案明确"放行此操作",和
-            #    普通提醒"点我看下一条"区分开,避免用户在翻阅时误点放行(队列混淆)。
-            verb = self._danger_verb(command)
-            shown = command if len(command) <= 44 else command[:44] + "…"
-            bubble = (
-                f"⚠️ 皮卡丘要{verb}「{shown}」—— 不可逆操作!\n"
-                f"左键=放行此操作 ✓  右键=不做 ✕"
-            )
-            self._pending_confirms[req_id] = {
-                "command": command, "ts": hook_ts, "bubble": bubble,
-            }
-            self._confirm_bubble_to_id[bubble] = req_id
+            # ② 建一个两按钮确认 overlay。命令带中文动词解释 + 截断显示;两个按钮
+            #    (✓ 放行 / ✕ 不做)都是左键单击,Mac 触控板也能稳点,不依赖右键。
+            #    关键:begin_await 已 +1,若下面建 widget/connect 中途抛异常,这条不会
+            #    进 _pending_confirms,也就永远不会被 _remove_confirm → end_await,
+            #    导致 await 计数永久 +1、硬超时被永久暂停。用 try 兜底:失败就回滚 +1。
+            try:
+                verb = self._danger_verb(command)
+                # 头+尾截断:长命令只截中间,保住开头(命令名)和结尾(常是要删的
+                # 目标路径)。否则只留前 44 字会把"删的是哪里"这个最关键信息切掉。
+                shown = self._shorten_command(command, 48)
+                text = f"⚠️ 皮卡丘要{verb}\n「{shown}」\n—— 不可逆操作!"
+                widget = _ConfirmBubble(text, self)
+                # 用默认参数绑定 req_id,避免闭包晚绑定取到循环末值。
+                widget.allowed.connect(
+                    lambda _=False, rid=req_id: self._on_confirm_allowed(rid))
+                widget.denied.connect(
+                    lambda _=False, rid=req_id: self._on_confirm_denied(rid))
+                self._pending_confirms[req_id] = {
+                    "command": command, "ts": hook_ts, "widget": widget,
+                }
+                self._confirm_order.append(req_id)
+            except Exception:
+                # 构造失败 → 回滚刚 +1 的计数,防止硬超时被永久暂停。这条 req_id
+                # 已在 _seen_confirm_ids 里(不重试),hook 那边会自己 280s 超时 deny。
+                try:
+                    claude_bridge.end_await()
+                except Exception:
+                    pass
+                continue
             self._flash_state("surprise", 1600)
-            # 危险确认插到 sticky 队首:不让它排在普通提醒后面被"看下一条"误点放行。
-            self._show_confirm_bubble(bubble)
+            # 同一时刻只显示一个 overlay;没有正在显示的就把这条亮出来。
+            self._show_next_confirm()
+
+    @staticmethod
+    def _shorten_command(command, limit):
+        """长命令头+尾截断(中间用 … 省略),保住命令名和目标路径两头的关键信息。
+
+        例:`sudo rm -rf /Users/me/very/long/path/to/important/backup` 不该只显示
+        `sudo rm -rf /Users/me/very/long/path…`(看不到删的是 backup),而是
+        `sudo rm -rf /Users/me/ve … ant/backup`,两头都留。
+        """
+        command = command.strip()
+        if len(command) <= limit:
+            return command
+        # 给省略号留 1 个位置;头略多于尾(开头的命令名更重要)
+        keep = limit - 1
+        head = (keep + 1) // 2
+        tail = keep - head
+        return command[:head] + "…" + command[-tail:]
 
     @staticmethod
     def _danger_verb(command):
@@ -1045,19 +1156,65 @@ class PikachuPet(QWidget):
             return "关机/重启"
         return "执行"
 
-    def _show_confirm_bubble(self, bubble):
-        """把危险确认气泡插到 sticky 队首并立即显示(优先于普通提醒,防误点)。"""
-        # 已在队列(同文本)就不重复插
-        if bubble in self._sticky_queue:
-            self._refresh_sticky_text()
+    def _show_next_confirm(self):
+        """显示确认队列里下一条的两按钮 overlay(同一时刻只显示一个)。
+
+        当前已有在显示的就不动(等它被处理掉再轮到下一条)。队列里跳过已被回收
+        /决策掉的 req_id。把 overlay 居中摆在本体顶部(与普通气泡同位),叠在最上层。
+        """
+        if self._active_confirm is not None:
             return
-        self._sticky_queue.insert(0, bubble)
-        # 超出上限时丢【队尾】(普通提醒),保住刚插到队首的危险确认
-        if len(self._sticky_queue) > config.STICKY_QUEUE_MAX:
-            del self._sticky_queue[-1]
-        # 强制把队首这条危险确认显示出来(无论当前在显示哪条)
-        self._bubble_sticky = True
-        self._render_bubble(self._sticky_text(), sticky=True)
+        # 取队列里第一个仍然 pending 的 req_id
+        rid = None
+        while self._confirm_order:
+            cand = self._confirm_order[0]
+            if cand in self._pending_confirms:
+                rid = cand
+                break
+            self._confirm_order.pop(0)   # 已被处理掉的,丢弃
+        if rid is None:
+            return
+        info = self._pending_confirms.get(rid)
+        widget = info.get("widget") if info else None
+        if widget is None:
+            return
+        self._active_confirm = rid
+        # 把顶部让给确认浮层:若此刻普通气泡正显示着,先收起它(否则两者 y=2 重叠,
+        # 且后渲染的会 raise_ 盖住对方)。sticky 提醒仍在 _sticky_queue 里、不丢,
+        # 浮层全部处理完会 flush。普通气泡的自动消失 timer 也停掉,避免它中途 hide
+        # 时连带把刚摆好的浮层逻辑搅乱。
+        self.bubble.hide()
+        self._bubble_timer.stop()
+        self._position_confirm(widget)
+        widget.show()
+        widget.raise_()
+
+    def _position_confirm(self, widget):
+        """把确认 overlay 居中摆到本体顶部(与普通气泡同位置),按内容自适应尺寸。"""
+        max_w = min(self.BUBBLE_MAX_W, self.width() - 8)
+        widget.setMaximumWidth(max_w)
+        widget.adjustSize()
+        if widget.width() > max_w:
+            widget.setFixedWidth(max_w)
+            widget.adjustSize()
+        bx = (self.width() - widget.width()) // 2
+        widget.move(max(2, bx), 2)
+
+    def _on_confirm_allowed(self, req_id):
+        """点了「✓ 放行」:写 allow 决策 → hook 放行 → 清理本条 → 切开心。"""
+        if req_id not in self._pending_confirms:
+            return
+        self._last_interact = self._t.elapsed()
+        self._resolve_confirm(req_id, "allow")
+        self._flash_state("happy", 1800)
+
+    def _on_confirm_denied(self, req_id):
+        """点了「✕ 不做」:写 deny 决策 → hook 拒绝 → 清理本条 → 切沮丧。"""
+        if req_id not in self._pending_confirms:
+            return
+        self._last_interact = self._t.elapsed()
+        self._resolve_confirm(req_id, "deny")
+        self._flash_state("sad", 1600)
 
     def _sweep_expired_confirms(self):
         """回收已超时的待确认项:hook 那边 280s 会自己 deny 退出,桌宠侧据此清理,
@@ -1076,16 +1233,28 @@ class PikachuPet(QWidget):
             self.show_bubble("*耳朵耷拉* 等太久啦,那个操作皮卡丘先没做哦~", sticky=False)
 
     def _remove_confirm(self, req_id):
-        """从所有结构里移除一条待确认 + 出队气泡 + 递减 await 计数。决策由调用方先写。"""
+        """从所有结构里移除一条待确认 + 销毁其 overlay + 递减 await 计数。决策由调用方先写。"""
         info = self._pending_confirms.pop(req_id, None)
         if info is None:
             return
-        bubble = info.get("bubble")
-        self._confirm_bubble_to_id.pop(bubble, None)
-        if bubble in self._sticky_queue:
-            self._sticky_queue.remove(bubble)
-        # 当前正显示的就是这条 → 刷新到下一条(或收起)
-        self._show_next_sticky()
+        widget = info.get("widget")
+        if widget is not None:
+            try:
+                widget.hide()
+                widget.deleteLater()
+            except Exception:
+                pass
+        if req_id in self._confirm_order:
+            self._confirm_order.remove(req_id)
+        # 这条正显示着 → 让出位置,显示下一条待确认(若有)
+        if self._active_confirm == req_id:
+            self._active_confirm = None
+            self._show_next_confirm()
+        # 所有确认都处理完了 → 把之前被压住的 sticky 提醒重新亮出来(它们一直在
+        # _sticky_queue 里没丢,只是确认浮层活跃期间被 _render_bubble 拦着没渲染)。
+        if not self._confirm_active() and self._sticky_queue:
+            self._bubble_sticky = False   # 复位,让 _show_next_sticky 真正渲染
+            self._show_next_sticky()
         try:
             claude_bridge.end_await()   # 这条不再等人,递减计数(归零才恢复硬超时)
         except Exception:
@@ -1600,6 +1769,14 @@ class PikachuPet(QWidget):
         # claude 调用恢复正常超时/被下面的 cancel+killpg 干净杀掉(连 hook 子进程)。
         try:
             claude_bridge.reset_await()
+        except Exception:
+            pass
+        # 停掉确认轮询 timer:下面 wait() 会泵事件循环,若 timer 仍在跑会再触发
+        # _check_pending_confirms → _sweep → _remove_confirm 去碰已 deleteLater 的
+        # overlay(RuntimeError 虽被吞但无谓)。退出阶段确认逻辑已无意义,直接停。
+        try:
+            if hasattr(self, "_confirm_timer"):
+                self._confirm_timer.stop()
         except Exception:
             pass
         workers = list(self._sched_workers)
