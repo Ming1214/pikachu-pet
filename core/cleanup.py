@@ -15,6 +15,7 @@ leader(pgid==pid),MCP 孙进程也在同组,killpg 一次连根拔。
 """
 
 import os
+import shutil
 import signal
 import threading
 import time
@@ -129,6 +130,52 @@ def remove_garbage_files():
             os.remove(path)
         except OSError:
             pass
+    _remove_chat_upload_dirs()
+
+
+def _remove_chat_upload_dirs():
+    """删聊天窗发图/文件的附件副本目录(整目录,属运行时垃圾,不入库、退出清)。
+
+    上传目录按 pid 隔离命名(.chat_uploads_<pid>)。这里【按 pid 存活探测】删:
+      - 本进程自己的目录:直接删。
+      - 其它 .chat_uploads_<pid>:仅当该 pid 已不存在(进程已死)才删。
+    这样兼顾两个场景:
+      ① 看门狗是独立进程(pid 不同),主进程死后它来清——主进程那个 pid 已死,
+         其目录会被探测到并删掉,不会因 pid 不匹配而漏清。
+      ② 多个桌宠实例并存——另一个仍存活实例的目录(pid 还在)会被保留,绝不误删
+         它正让 claude Read 的副本(同 .tmp 用 pid 精确匹配的谨慎做法)。
+    用 rmtree + ignore_errors=True 保证幂等。失败不致命(下次启动会重建)。
+    """
+    import glob
+    import re as _re
+    base = getattr(config, "BASE_DIR", "")
+    own = os.getpid()
+    if not base:
+        return
+    for d in glob.glob(os.path.join(base, ".chat_uploads_*")):
+        m = _re.search(r"\.chat_uploads_(\d+)$", d)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        if pid != own and _pid_alive(pid):
+            continue            # 另一个仍存活实例的目录,保留
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """探测某 pid 是否仍存在(不发真信号)。无法判定时保守当作存活(宁可不删)。"""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True             # 存在但非本用户:存在即视为存活,保守不删
+    except OSError:
+        return True             # 判定不了 → 保守当存活,绝不误删
 
 
 def reset_system_state():

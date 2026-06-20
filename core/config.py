@@ -143,6 +143,20 @@ CLAUDE_PERMISSION_MODE = "auto"
 # 非空时 claude_bridge 给每次调用追加 --model。
 CLAUDE_MODEL = ""
 
+# 用户在聊天窗发给皮卡丘的图片/文件副本目录(运行时垃圾,退出清,不入库)。
+# claude -p 不能直接收附件二进制,要让皮卡丘"看"图/读文件,得把它存到磁盘、把绝对
+# 路径写进 prompt,让 claude 用 Read 工具读取(auto 模式下 Read 无需权限)。
+# 放在 BASE_DIR(= 项目根 = CLAUDE_WORKDIR)下:cwd 内的路径 auto 模式读取最稳,
+# 免去 --add-dir。整个目录退出时由 cleanup.remove_garbage_files() 用 rmtree 清掉。
+# 【按 pid 隔离】:目录名带本进程 pid,这样多个桌宠实例各用各的上传目录,退出时
+# 各删各的,绝不会删掉另一个实例正在让 claude Read 的副本(同 .tmp 用 pid 精确匹配
+# 的谨慎做法)。
+CHAT_UPLOAD_DIR = os.path.join(BASE_DIR, f".chat_uploads_{os.getpid()}")
+# 单个上传附件大小上限(字节):超过则拒收并提示。原因:① shutil.copy 大文件会同步
+# 卡住 UI;② claude 的 Read 工具对大文件本就会截断,发了也读不全,白占磁盘。20MB
+# 对图片/文档/表格够用;真要分析超大数据让用户直接把路径告诉皮卡丘更合适。
+CHAT_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+
 # ─────────────────────  危险操作三层确认(A 硬拦截 + B 软护栏 + C 透明)  ─────────────────────
 # auto 模式让 claude 自己判断安全性,没有用户确认环节(桌宠非交互)。万一它误判、
 # 在用户没预期时跑了不可逆操作就麻烦了。这里加三层防护,但【只拦极少数真不可逆命令】,

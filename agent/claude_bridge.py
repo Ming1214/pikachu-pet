@@ -10,6 +10,7 @@
 这样既不卡,又有上下文记忆。
 """
 
+import base64
 import json
 import os
 import shlex
@@ -235,18 +236,153 @@ def _scheduling_hint() -> str:
     )
 
 
-def _build_prompt(user_text: str, history: list[tuple[str, str]] | None) -> str:
-    """把历史对话 + 当前输入拼成一个 prompt。
+def _segments_to_text(segments: list[dict]) -> str:
+    """把"文字/文件混排的一条消息"拼成发给 claude 的【文本】部分。
+
+    segment 三类:
+      {"type": "text",  "text": "..."}                普通文字 → 原样
+      {"type": "file",  "path": "/绝对/路径", "name": "原名"}  文件 → "请 Read 路径"指令
+      {"type": "image", "path": "/绝对/路径"}          图片 → 【跳过】
+
+    【图片为何跳过】:经实证,让 claude 用 Read 工具读图片文件【读不到真实视觉内容、
+    会幻觉】(后端 Read 图这条路不通)。图片改走真正的多模态 content block(base64),
+    见 _segments_to_content_blocks,不进文本。这里只负责文字 + 文件(文件 Read 文本
+    返回真实内容,不受影响)。
+    """
+    parts = []
+    for seg in segments or []:
+        kind = seg.get("type")
+        if kind == "file":
+            path = seg.get("path", "")
+            name = seg.get("name", "") or path
+            parts.append(
+                f"\n[用户发来一个文件「{name}」,绝对路径:{path} —— "
+                f"请用 Read 工具读取这个路径来查看文件内容]\n")
+        elif kind == "image":
+            continue                       # 图片走多模态,不进文本
+        else:
+            parts.append(seg.get("text", ""))
+    return "".join(parts).strip()
+
+
+def _media_type(path: str) -> str:
+    """按扩展名给图片的 media_type(多模态 image block 用)。缺省 image/png。"""
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp",
+    }.get(ext, "image/png")
+
+
+def _segments_to_content_blocks(
+    segments: list[dict], history_preamble: str = "") -> tuple[list[dict], bool]:
+    """把 segments 转成 Anthropic content block 数组(供 stream-json 多模态输入)。
+
+    顺序保持图文混排:text 段 → text block;image 段 → base64 image block;
+    file 段 → text block(让 claude Read 该路径,文本文件 Read 内容真实)。
+    history_preamble 非空时作为【首个 text block】注入多轮历史 + 引导语。
+
+    返回 (blocks, has_image_block):has_image_block 表示至少成功放进了一张图;
+    某张图读盘/编码失败则跳过那一块(不让整条消息崩)。
+    """
+    blocks: list[dict] = []
+    if history_preamble:
+        blocks.append({"type": "text", "text": history_preamble})
+    has_image_block = False
+    for seg in segments or []:
+        kind = seg.get("type")
+        if kind == "image":
+            try:
+                with open(seg["path"], "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64",
+                               "media_type": _media_type(seg["path"]),
+                               "data": b64},
+                })
+                has_image_block = True
+            except Exception:
+                continue                   # 这张读不了就跳过
+        elif kind == "file":
+            name = seg.get("name", "") or seg.get("path", "")
+            blocks.append({"type": "text", "text":
+                f"[用户发来一个文件「{name}」,绝对路径:{seg.get('path','')} —— "
+                f"请用 Read 工具读取这个路径来查看文件内容]"})
+        else:
+            txt = seg.get("text", "")
+            if txt:
+                blocks.append({"type": "text", "text": txt})
+    return blocks, has_image_block
+
+
+def _extract_stream_result(stdout: str) -> tuple[str, bool]:
+    """从 stream-json(多行 NDJSON)输出里提取最终回复文本与 is_error。
+
+    优先取 type=="result" 那行的 result 字段;没有则把所有 assistant 消息的文本
+    块拼起来兜底。返回 (reply, is_error)。
+    """
+    result_text = None
+    is_error = False
+    assistant_parts = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        et = ev.get("type")
+        if et == "result":
+            result_text = ev.get("result")
+            is_error = bool(ev.get("is_error"))
+        elif et == "assistant":
+            # assistant 事件:message.content 是 block 数组,收集其 text
+            msg = ev.get("message") or {}
+            for blk in (msg.get("content") or []):
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    assistant_parts.append(blk.get("text", ""))
+    if result_text is not None:
+        return (result_text or "").strip(), is_error
+    return "".join(assistant_parts).strip(), False
+
+
+def _build_prompt(
+    user_text: str,
+    history: list[tuple[str, str]] | None,
+    has_file: bool = False,
+) -> str:
+    """把历史对话 + 当前输入拼成一个 prompt(纯文本/纯文件路径用)。
 
     history: [(role, text), ...],role 为 '我' 或 '皮卡丘'。
+    has_file: 当前消息含【文件】附件(图片不走这里,走多模态)。为 True 时追加一句
+        说明,确保 claude 真去 Read 文件内容再回应。
     """
+    file_hint = (
+        "\n（提示:我这条消息里包含文件,上面用方括号标了它的绝对路径。"
+        "请你先用 Read 工具读取那个路径把内容看清楚,再用皮卡丘的口吻回应我。）"
+        if has_file else "")
     if not history:
-        return user_text
+        return user_text + file_hint
     lines = ["以下是我们之前的对话记录,供你参考上下文:\n"]
     for role, text in history:
         lines.append(f"{role}：{text}")
     lines.append("\n现在请回应我最新的这句话：")
-    lines.append(user_text)
+    lines.append(user_text + file_hint)
+    return "\n".join(lines)
+
+
+def _history_preamble(history: list[tuple[str, str]] | None) -> str:
+    """多模态分支用:只把【历史 + 引导语】拼成一段文字(当前消息文本已在 content
+    blocks 里,不重复)。无历史则返回空串(此时不加这个 text block)。
+    """
+    if not history:
+        return ""
+    lines = ["以下是我们之前的对话记录,供你参考上下文:\n"]
+    for role, text in history:
+        lines.append(f"{role}：{text}")
+    lines.append("\n现在请结合上面的上下文,回应我【接下来这条带图片/文件的消息】：")
     return "\n".join(lines)
 
 
@@ -312,18 +448,33 @@ def ask_pikachu(
     *,
     history: list[tuple[str, str]] | None = None,
     cancel_event: threading.Event | None = None,
+    segments: list[dict] | None = None,
 ) -> str:
     """把一句话发给皮卡丘(claude),返回回复文本。
 
     Args:
-        prompt: 用户当前输入。
+        prompt: 用户当前输入(纯文本路径用;有 segments 时此值被忽略)。
         history: 之前的对话(用于多轮记忆),(role, text) 列表。
         cancel_event: 外部可置位以取消本次调用。
+        segments: 图文混排的一条消息(有序 text/image 段)。传入时用它构造当前
+            消息(图片转成"请 Read 这个路径"的指令文本,见 _segments_to_text);
+            不传则维持旧的纯字符串路径(零回归)。
 
     Raises:
         ClaudeError: claude 不可用、超时、被取消或返回错误时。
     """
-    full_prompt = _build_prompt(prompt, history)
+    # 区分三种情形:
+    #   has_image —— 含图片:走多模态 stream-json 输入(base64 content block)。
+    #   纯文件/纯文本 —— 走原 -p 文本路径(文件靠 Read 读,文本/代码 Read 内容真实)。
+    has_image = bool(segments) and any(s.get("type") == "image" for s in segments)
+    if segments is not None:
+        has_file = any(s.get("type") == "file" for s in segments)
+        current_text = _segments_to_text(segments)   # 只含文字 + 文件指令(图片跳过)
+    else:
+        has_file = False
+        current_text = prompt
+    # 无图分支用的纯文本 prompt(有图分支改用 content blocks,full_prompt 不参与发送)
+    full_prompt = _build_prompt(current_text, history, has_file=has_file)
     # 调用日志打点:记开始时刻与 prompt 长度,出口处(成功/失败)统一写一行元数据。
     _t0 = time.monotonic()
     _plen = len(full_prompt)
@@ -339,19 +490,46 @@ def ask_pikachu(
         except Exception:
             pass
 
-    cmd = [
-        config.CLAUDE_BIN,
-        "-p", full_prompt,
-        "--append-system-prompt", persona,
-        # auto 模式:智能判断每个操作的安全性,安全的(读/写常规文件、查询)
-        # 自动放行,危险的(rm -rf、外发数据等)才拦截。桌宠非交互,无法手动点
-        # "允许",auto 模式既能干活又有安全兜底,比 acceptEdits 更顺手。
-        "--permission-mode", config.CLAUDE_PERMISSION_MODE,
-        # 不再用 --add-dir 限制目录:auto 模式靠安全性判断,不靠目录白名单,
-        # 否则写到白名单外(如 ~/Desktop)又会被卡。
-        "--output-format", "json",
-        # 注意:故意不加 --continue(会卡死)
-    ]
+    # 有图片 → 走多模态 stream-json 输入(prompt 走 stdin,不用 -p);
+    # 否则 → 原 -p 文本路径(零回归)。两分支共用下面的人设/权限/MCP/hook 参数。
+    stdin_data = None
+    if has_image:
+        preamble = _history_preamble(history)
+        blocks, got_image = _segments_to_content_blocks(segments, preamble)
+        # 所有图都读盘/编码失败(文件被删/权限问题)→ 别静默发一条无图消息让皮卡丘
+        # 假装看过,如实报错让用户重发。(部分失败则已在 content_blocks 里跳过坏的那张。)
+        if not got_image:
+            _log_call("chat", _t0, False, _plen, 0)
+            raise ClaudeError("皮卡丘没能打开你发的图片(文件可能已不在了),再发一次试试?")
+        user_msg = {"type": "user",
+                    "message": {"role": "user", "content": blocks}}
+        stdin_data = json.dumps(user_msg, ensure_ascii=False) + "\n"
+        # 日志体积:有图时 prompt_chars 计入 stdin 的实际长度(含 base64),
+        # 否则只记无图文本长度会严重低估真实发送体量(纯可观测性,不影响功能)。
+        _plen = len(stdin_data)
+        cmd = [
+            config.CLAUDE_BIN,
+            # stream-json 输入:本机 CLI 要求输入输出都是 stream-json,且需 --verbose。
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--append-system-prompt", persona,
+            "--permission-mode", config.CLAUDE_PERMISSION_MODE,
+        ]
+    else:
+        cmd = [
+            config.CLAUDE_BIN,
+            "-p", full_prompt,
+            "--append-system-prompt", persona,
+            # auto 模式:智能判断每个操作的安全性,安全的(读/写常规文件、查询)
+            # 自动放行,危险的(rm -rf、外发数据等)才拦截。桌宠非交互,无法手动点
+            # "允许",auto 模式既能干活又有安全兜底,比 acceptEdits 更顺手。
+            "--permission-mode", config.CLAUDE_PERMISSION_MODE,
+            # 不再用 --add-dir 限制目录:auto 模式靠安全性判断,不靠目录白名单,
+            # 否则写到白名单外(如 ~/Desktop)又会被卡。
+            "--output-format", "json",
+            # 注意:故意不加 --continue(会卡死)
+        ]
 
     # 模型:CLAUDE_MODEL 非空才传 --model;默认空 = 跟随 claude CLI 自身配置(零回归)。
     # 控制台可在线改成便宜模型给后台任务降本。每次调用实时读 config,改了立刻生效。
@@ -375,7 +553,8 @@ def ask_pikachu(
         proc = subprocess.Popen(
             cmd,
             cwd=config.CLAUDE_WORKDIR,
-            stdin=subprocess.DEVNULL,
+            # 有图片 → 要往 stdin 写多模态 JSON,故 PIPE;否则 DEVNULL(原行为)。
+            stdin=subprocess.PIPE if has_image else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -403,8 +582,10 @@ def ask_pikachu(
         # try/finally:communicate() 可能抛(如管道被 _kill_proc_tree 提前 close
         # 后再读)。若不兜底,_deregister_proc 漏调(stale pid 残留→PID 复用误杀)、
         # done.set() 漏调(主线程在 done.wait(3) 上白等满 3 秒才超时返回)。
+        # communicate(input=...) 同时写 stdin、读 stdout/stderr、等子进程退出——
+        # 一次调用搞定,天然避开 stdin/stdout 管道互锁(大 base64 也不会卡)。
         try:
-            out, err = proc.communicate()
+            out, err = proc.communicate(input=stdin_data)
             holder["out"], holder["err"] = out, err
         except Exception:
             holder.setdefault("out", "")
@@ -453,14 +634,21 @@ def ask_pikachu(
         raise ClaudeError(f"皮卡丘卡住了:{detail[:300]}")
 
     reply = ""
-    try:
-        data = json.loads(stdout)
-        if data.get("is_error"):
+    if has_image:
+        # 多模态分支:stream-json 输出是多行 NDJSON,从 result 事件取回复。
+        reply, is_err = _extract_stream_result(stdout)
+        if is_err:
             _log_call("chat", _t0, False, _plen, 0)
-            raise ClaudeError(f"皮卡丘报错了:{str(data.get('result', '未知错误'))[:300]}")
-        reply = (data.get("result") or "").strip()
-    except json.JSONDecodeError:
-        reply = stdout.strip()
+            raise ClaudeError(f"皮卡丘报错了:{reply[:300] or '未知错误'}")
+    else:
+        try:
+            data = json.loads(stdout)
+            if data.get("is_error"):
+                _log_call("chat", _t0, False, _plen, 0)
+                raise ClaudeError(f"皮卡丘报错了:{str(data.get('result', '未知错误'))[:300]}")
+            reply = (data.get("result") or "").strip()
+        except json.JSONDecodeError:
+            reply = stdout.strip()
 
     if not reply:
         _log_call("chat", _t0, False, _plen, 0)

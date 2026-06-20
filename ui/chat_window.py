@@ -6,18 +6,22 @@
 
 import os
 import random
+import re
+import shutil
 import threading
 import time
+import uuid
 
 from PyQt6.QtCore import (
     Qt, QThread, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal, QRectF,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QPainter, QPainterPath, QPixmap, QPen,
+    QBrush, QColor, QImage, QPainter, QPainterPath, QPixmap, QPen,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel,
-    QLineEdit, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout,
+    QLabel, QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 
 import claude_bridge
@@ -28,16 +32,20 @@ import scheduler
 
 FONT = config.FONT_STACK
 
+# 可识别为"图片"的扩展名(拖拽/粘贴文件 URL 时据此判定要不要当图片收下)
+_IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
+
 
 class ClaudeWorker(QThread):
     succeeded = pyqtSignal(str)
     failed = pyqtSignal(str)
     tick = pyqtSignal(int)
 
-    def __init__(self, prompt, history=None):
+    def __init__(self, prompt, history=None, segments=None):
         super().__init__()
         self._prompt = prompt
         self._history = history or []
+        self._segments = segments      # 图文混排消息(None=纯文本走旧路径)
         self._cancel = threading.Event()
 
     def cancel(self):
@@ -58,7 +66,8 @@ class ClaudeWorker(QThread):
         threading.Thread(target=_ticker, daemon=True).start()
         try:
             reply = claude_bridge.ask_pikachu(
-                self._prompt, history=self._history, cancel_event=self._cancel)
+                self._prompt, history=self._history, cancel_event=self._cancel,
+                segments=self._segments)
             if not self._cancel.is_set():
                 self.succeeded.emit(reply)
         except claude_bridge.ClaudeError as exc:
@@ -173,6 +182,116 @@ class _TitleBar(QWidget):
         self._drag = None
 
 
+class _ChatInput(QTextEdit):
+    """多行聊天输入框(替代单行 QLineEdit):
+
+    - Enter 发送(发 submit 信号);Option/Alt+Enter、Shift+Enter 插入换行。
+    - 高度随内容在 [单行, 5 行] 间自适应,超出则内部滚动。
+    - 拖拽/粘贴本地文件(任意类型)→ 发 path_received(str 路径,窗口侧按扩展名
+      分流图片/文件);Ctrl+V 粘贴剪贴板里的位图(如截图)→ 发 image_received(QImage)。
+    """
+
+    submit = pyqtSignal()
+    image_received = pyqtSignal(object)   # QImage(剪贴板位图,如截图)
+    path_received = pyqtSignal(str)       # 本地文件路径(任意类型,窗口侧分流)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setAcceptRichText(False)        # 只收纯文本,避免粘进富文本格式
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._min_h = 42                     # 约单行(含 padding)
+        self._max_h = 130                    # 约 5 行后转为内部滚动
+        self.setFixedHeight(self._min_h)
+        self.textChanged.connect(self._autosize)
+
+    def _autosize(self):
+        """随文档内容增高,封顶后保持固定高度由内部滚动。"""
+        doc_h = self.document().size().height()
+        h = int(doc_h) + 14                  # 上下 padding 余量
+        h = max(self._min_h, min(h, self._max_h))
+        if h != self.height():
+            self.setFixedHeight(h)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            # IME(中文输入法)组字时按 Enter 确认候选词:这种 Enter 的 e.text()
+            # 为空(真正的字符走 inputMethodEvent),交回基类处理,别误当成"发送"——
+            # 否则第三方输入法选词时会把半成品消息提前发出去。
+            if not e.text():
+                super().keyPressEvent(e)
+                return
+            mods = e.modifiers()
+            # Option(macOS Alt)/ Shift + Enter → 换行;纯 Enter → 发送
+            if mods & (Qt.KeyboardModifier.AltModifier
+                       | Qt.KeyboardModifier.ShiftModifier):
+                self.insertPlainText("\n")
+                return
+            self.submit.emit()
+            return
+        super().keyPressEvent(e)
+
+    # ── 粘贴(Ctrl/Cmd+V):剪贴板有本地文件就当附件收,有位图就当图收,否则纯文本粘 ──
+    def insertFromMimeData(self, source):
+        if source.hasUrls():
+            handled = False
+            for url in source.urls():
+                p = url.toLocalFile()
+                if p and os.path.isfile(p):
+                    self.path_received.emit(p)
+                    handled = True
+            if handled:
+                return
+        if source.hasImage():
+            img = source.imageData()
+            if isinstance(img, QImage) and not img.isNull():
+                self.image_received.emit(img)
+                return
+        super().insertFromMimeData(source)
+
+    # ── 拖拽:含本地文件(任意类型)或位图就接收 ──
+    def _has_file_drop(self, e):
+        md = e.mimeData()
+        if md.hasImage():
+            return True
+        if md.hasUrls():
+            return any(u.toLocalFile() and os.path.isfile(u.toLocalFile())
+                       for u in md.urls())
+        return False
+
+    def dragEnterEvent(self, e):
+        if self._has_file_drop(e):
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if self._has_file_drop(e):
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        md = e.mimeData()
+        took = False
+        if md.hasUrls():
+            for url in md.urls():
+                p = url.toLocalFile()
+                if p and os.path.isfile(p):
+                    self.path_received.emit(p)
+                    took = True
+        if not took and md.hasImage():
+            img = md.imageData()
+            if isinstance(img, QImage) and not img.isNull():
+                self.image_received.emit(img)
+                took = True
+        if took:
+            e.acceptProposedAction()
+        else:
+            super().dropEvent(e)
+
+
 class ChatWindow(QWidget):
     # 桌宠本体据此呼应:开始等 claude → 进思考态;结束 → 退出
     thinking_started = pyqtSignal()
@@ -199,6 +318,11 @@ class ChatWindow(QWidget):
         # "正在想"气泡的复制按钮:占位时隐藏,真回复落定(_release_thinking)才 show。
         self._thinking_copy = None
         self._pending_user = ""
+        # 本条待发消息里已挂账的附件:序号 → {"type":"image"|"file","path":...,"name":...}。
+        # 图片和文件【共用同一套序号】(_attach_counter),所以 [图片 #1] 与 [文件 #2]
+        # 不会撞号。发送/清空时重置;序号只增不减,删占位符也不复用,避免歧义。
+        self._pending_attachments = {}
+        self._attach_counter = 0
         self._history = []
         # claude 不可用降级时,只在【本窗口首次】降级带完整提示(那句很长,解释要装
         # Claude Code);之后只回纯拟声词,免得连发多条被同一句长提示刷屏。
@@ -274,18 +398,51 @@ class ChatWindow(QWidget):
         self.scroll.setWidget(self.box)
         col.addWidget(self.scroll, 1)
 
-        # 输入栏(白底 + 黑描边圆角输入框 + 红色发送圆钮)
+        # 输入栏(白底 + 黑描边圆角输入框 + 📎图片钮 + 红色发送圆钮)
         bar = QWidget(); bar.setStyleSheet(f"background:{config.COL_CARD_BG};")
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(12, 10, 12, 14); row.setSpacing(8)
+        bar_col = QVBoxLayout(bar)
+        bar_col.setContentsMargins(0, 0, 0, 0); bar_col.setSpacing(0)
 
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("和皮卡丘说点什么…")
-        self.input.returnPressed.connect(self._send)
+        # 附件失败/提示行(平时隐藏,失败时在输入框上方临时显示,不打断聊天消息流)
+        self.attach_tip = QLabel("")
+        self.attach_tip.setVisible(False)
+        self.attach_tip.setWordWrap(True)
+        self.attach_tip.setStyleSheet(
+            "QLabel{color:#C40D0D; background:#FFF0F0; border:1px solid #F2C0C0;"
+            f"border-radius:10px; padding:5px 12px; font-size:12px; font-family:{FONT};}}")
+        tip_wrap = QWidget(); tip_wrap.setStyleSheet(f"background:{config.COL_CARD_BG};")
+        tip_l = QHBoxLayout(tip_wrap)
+        tip_l.setContentsMargins(12, 8, 12, 0); tip_l.setSpacing(0)
+        tip_l.addWidget(self.attach_tip)
+        bar_col.addWidget(tip_wrap)
+
+        row_wrap = QWidget(); row_wrap.setStyleSheet(f"background:{config.COL_CARD_BG};")
+        row = QHBoxLayout(row_wrap)
+        row.setContentsMargins(12, 10, 12, 14); row.setSpacing(8)
+        # 输入栏底部对齐:输入框多行变高时,📎/发送钮贴着底边,不被拉伸居中
+        row.setAlignment(Qt.AlignmentFlag.AlignBottom)
+
+        # 📎 图片按钮(白底黑描边圆钮,与发送钮同风格)→ 多选图片文件
+        self.attach = QPushButton("📎")
+        self.attach.setFixedSize(42, 42)
+        self.attach.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.attach.setToolTip("发送图片或文件(也可拖入或粘贴)")
+        self.attach.clicked.connect(self._pick_files)
+        self.attach.setStyleSheet(
+            "QPushButton{background:#FFFFFF; border:2px solid #2B2B2B; border-radius:21px;"
+            "font-size:16px; color:#2B2B2B;}"
+            "QPushButton:hover{background:#FFF4C2;}")
+        row.addWidget(self.attach)
+
+        self.input = _ChatInput()
+        self.input.setPlaceholderText("和皮卡丘说点什么…(Enter 发送 / Option+Enter 换行)")
+        self.input.submit.connect(self._send)
+        self.input.image_received.connect(self._attach_image)
+        self.input.path_received.connect(self._attach_path)
         self.input.setStyleSheet(
-            "QLineEdit{background:#F4F4F4; border:2px solid #2B2B2B; border-radius:20px;"
-            f"padding:9px 16px; font-size:14px; color:#2B2B2B; font-family:{FONT};}}"
-            "QLineEdit:focus{border-color:#EE1515; background:#FFFFFF;}")
+            "QTextEdit{background:#F4F4F4; border:2px solid #2B2B2B; border-radius:20px;"
+            f"padding:7px 14px; font-size:14px; color:#2B2B2B; font-family:{FONT};}}"
+            "QTextEdit:focus{border-color:#EE1515; background:#FFFFFF;}")
         row.addWidget(self.input, 1)
 
         self.send = QPushButton("➤")
@@ -308,6 +465,7 @@ class ChatWindow(QWidget):
             "font-size:14px; color:#FFFFFF; font-weight:900;}"
             "QPushButton:hover{background:#666;}")
         row.addWidget(self.cancel)
+        bar_col.addWidget(row_wrap)
         col.addWidget(bar)
 
         # 随机宠物开场白
@@ -388,21 +546,192 @@ class ChatWindow(QWidget):
                 pass
         QTimer.singleShot(1500, _restore)
 
+    # ---------- 发附件(图片/任意文件):挂账 / 落盘 / 占位符 ----------
+    def _pick_files(self):
+        """📎 按钮:弹系统文件多选(任意类型),逐个挂账(落盘 + 插占位符)。
+
+        按扩展名分流:图片走「[图片 #n]」+ 缩略图,其余走「[文件 #n]」+ 文件卡片。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择图片或文件发给皮卡丘", os.path.expanduser("~"),
+            "所有文件 (*)")
+        for p in paths:
+            self._attach_path(p)
+
+    def _too_big(self, path):
+        """文件超过上限返回其大小(字节),否则返回 0。读不到大小当作 0(放行)。"""
+        try:
+            cap = getattr(config, "CHAT_UPLOAD_MAX_BYTES", 0)
+            if cap and os.path.getsize(path) > cap:
+                return os.path.getsize(path)
+        except OSError:
+            pass
+        return 0
+
+    def _attach_fail(self, msg):
+        """附件失败的轻提示:放在【输入框上方】临时显示,不插进聊天消息流——
+        否则失败气泡会夹在用户还没发出的消息之前,时序错乱。3.5s 后自动消失。
+        """
+        self.attach_tip.setText(msg)
+        self.attach_tip.setVisible(True)
+        # 守卫:仅当这条提示仍是当前显示的那条才隐藏(期间又来新提示则由新的接管计时)
+        def _hide(expected=msg):
+            try:
+                if self.attach_tip.text() == expected:
+                    self.attach_tip.clear()
+                    self.attach_tip.setVisible(False)
+            except RuntimeError:
+                pass
+        QTimer.singleShot(3500, _hide)
+
+    def _insert_placeholder(self, tag_text):
+        """在光标处插入占位符,智能补空格:若前一个字符不是空白/换行,先补一个空格,
+        避免和前面的文字粘成「你好[图片 #1]」难读、难在中间插字。
+        """
+        cur = self.input.textCursor()
+        pos = cur.position()
+        full = self.input.toPlainText()
+        prefix = ""
+        if pos > 0 and pos <= len(full) and full[pos - 1] not in (" ", "\n", "\t"):
+            prefix = " "
+        self.input.insertPlainText(prefix + tag_text + " ")
+
+    def _attach_image(self, src):
+        """收一张图(src 为文件路径 str,或剪贴板 QImage 位图)。落盘 + 挂账 + 插占位。"""
+        # 来源是磁盘文件时先查大小(QImage 是内存位图,不查)
+        if isinstance(src, str) and self._too_big(src):
+            self._attach_fail("这张图太大啦(超过 20MB),皮卡丘看不动~换张小点的?")
+            return
+        n = None
+        try:
+            up_dir = config.CHAT_UPLOAD_DIR
+            os.makedirs(up_dir, exist_ok=True)
+            self._attach_counter += 1
+            n = self._attach_counter
+            # 唯一文件名:uuid 防撞;序号入名便于人肉对应「[图片 #n]」。
+            tag = uuid.uuid4().hex[:8]
+            if isinstance(src, QImage):
+                dst = os.path.join(up_dir, f"paste_{n}_{tag}.png")
+                name = os.path.basename(dst)
+                if not src.save(dst, "PNG"):
+                    raise OSError("QImage.save 失败")
+            else:
+                ext = os.path.splitext(src)[1].lower() or ".png"
+                dst = os.path.join(up_dir, f"img_{n}_{tag}{ext}")
+                name = os.path.basename(src)
+                shutil.copy(src, dst)
+        except Exception as exc:
+            if n is not None:
+                self._attach_counter -= 1     # 落盘失败,序号回退保持连续
+            self._attach_fail(self._attach_err_msg(exc, "这张图"))
+            return
+        self._pending_attachments[n] = {"type": "image", "path": dst, "name": name}
+        self._insert_placeholder(f"[图片 #{n}]")
+
+    def _attach_file(self, src):
+        """收一个任意文件(src 为文件路径 str)。落盘 + 挂账 + 插「[文件 #n]」占位。"""
+        if self._too_big(src):
+            self._attach_fail("这个文件太大啦(超过 20MB),皮卡丘读不动~"
+                              "要不直接把路径发给皮卡丘让它自己去看?")
+            return
+        n = None
+        try:
+            up_dir = config.CHAT_UPLOAD_DIR
+            os.makedirs(up_dir, exist_ok=True)
+            self._attach_counter += 1
+            n = self._attach_counter
+            tag = uuid.uuid4().hex[:8]
+            base = os.path.basename(src) or f"file_{n}"
+            # 落盘名带序号 + uuid 防撞,保留原扩展名(claude Read 据扩展名识别格式更准)。
+            # 无扩展名文件(Makefile/LICENSE 等)落盘名也无扩展名,但卡片/prompt 用
+            # name 字段显示原名,claude 仍按纯文本读得了。
+            ext = os.path.splitext(base)[1]
+            dst = os.path.join(up_dir, f"file_{n}_{tag}{ext}")
+            shutil.copy(src, dst)
+        except Exception as exc:
+            if n is not None:
+                self._attach_counter -= 1
+            self._attach_fail(self._attach_err_msg(exc, "这个文件"))
+            return
+        self._pending_attachments[n] = {"type": "file", "path": dst, "name": base}
+        self._insert_placeholder(f"[文件 #{n}]")
+
+    @staticmethod
+    def _attach_err_msg(exc, what):
+        """按异常类型给具体提示:磁盘满单独点明,其余给通用文案。"""
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
+            return "磁盘空间不足啦,皮卡丘存不下这个附件了…清点空间再试?"
+        return f"*歪头* {what}皮卡丘没接住诶…换一个试试?"
+
+    def _attach_path(self, path):
+        """按扩展名把一个本地文件路径分流到 _attach_image / _attach_file。"""
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _IMG_EXTS:
+            self._attach_image(path)
+        else:
+            self._attach_file(path)
+
+    def _parse_segments(self, raw_text):
+        """把输入框纯文本(含「[图片 #n]」「[文件 #n]」占位)切成有序 segment 列表。
+
+        返回 [{"type":"text"|"image"|"file", ...}, ...]。已被用户手删占位符的附件
+        自然不出现;占位符引用了不存在/已删的序号则跳过该占位。
+        """
+        segments = []
+        last = 0
+        used = set()                         # 已消费的序号,防同一占位符被复制多份重复发
+        for m in re.finditer(r"\[(图片|文件) #(\d+)\]", raw_text):
+            pre = raw_text[last:m.start()]
+            if pre.strip():
+                segments.append({"type": "text", "text": pre})
+            n = int(m.group(2))
+            att = self._pending_attachments.get(n)
+            if att and n not in used:
+                used.add(n)
+                segments.append(dict(att))   # 拷一份,含 type/path/name
+            last = m.end()
+        tail = raw_text[last:]
+        if tail.strip():
+            segments.append({"type": "text", "text": tail})
+        return segments
+
+    @staticmethod
+    def _segments_plain(segments):
+        """把 segments 折叠成纯文本表示(图 → 「[图片]」,文件 → 「[文件:名]」),
+        用于历史/流水/复制。【不含绝对路径】:既保上下文连贯,又不泄露本地路径、
+        不诱发多轮里反复 Read 旧附件。
+        """
+        parts = []
+        for seg in segments:
+            if seg["type"] == "image":
+                parts.append("[图片]")
+            elif seg["type"] == "file":
+                parts.append(f"[文件:{seg.get('name', '') or '附件'}]")
+            else:
+                parts.append(seg["text"])
+        return "".join(parts).strip()
+
+    def _reset_pending(self):
+        """一条消息发出/清空后,重置待发附件挂账(序号计数不回退,避免复用歧义)。"""
+        self._pending_attachments = {}
+
     def _add(self, who, text):
         b = self._bubble(who, text)
         ts = self._time_label(who)
         # 气泡 + 时间戳竖直叠放,再整体左/右对齐
         col = QVBoxLayout(); col.setContentsMargins(0, 0, 0, 0); col.setSpacing(1)
         col.addWidget(b)
-        # 皮卡丘回复:时间戳 + 复制按钮并排放在气泡下方左侧;用户气泡只放时间戳。
+        # 时间戳 + 复制按钮并排在气泡下方:用户靠右、皮卡丘靠左。两侧都带复制按钮。
+        meta = QHBoxLayout(); meta.setContentsMargins(0, 0, 0, 0); meta.setSpacing(2)
         if who == "你":
-            col.addWidget(ts)
+            meta.addStretch()
+            meta.addWidget(self._copy_button(b))
+            meta.addWidget(ts)
         else:
-            meta = QHBoxLayout(); meta.setContentsMargins(0, 0, 0, 0); meta.setSpacing(2)
             meta.addWidget(ts)
             meta.addWidget(self._copy_button(b))
             meta.addStretch()
-            col.addLayout(meta)
+        col.addLayout(meta)
         col.setAlignment(b, Qt.AlignmentFlag.AlignRight if who == "你"
                          else Qt.AlignmentFlag.AlignLeft)
         row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
@@ -413,6 +742,107 @@ class ChatWindow(QWidget):
         self.msgs.insertLayout(self.msgs.count() - 1, row)
         QTimer.singleShot(30, self._scroll_bottom)
         return b
+
+    def _img_thumb(self, path):
+        """把一张图渲染成气泡里的缩略图 QLabel(限宽,保持比例,黑描边圆角)。"""
+        lab = QLabel()
+        pm = QPixmap(path)
+        if pm.isNull():
+            lab.setText("🖼️(图片读不出来了)")
+            lab.setStyleSheet(
+                f"color:{config.COL_USER_TEXT}; background:transparent;"
+                f"font-size:13px; font-family:{FONT};")
+            return lab
+        if pm.width() > 220:
+            pm = pm.scaledToWidth(220, Qt.TransformationMode.SmoothTransformation)
+        lab.setPixmap(pm)
+        lab.setStyleSheet(
+            "QLabel{border:2px solid #2B2B2B; border-radius:10px; background:transparent;}")
+        lab.setScaledContents(False)
+        return lab
+
+    @staticmethod
+    def _file_icon(name):
+        """按扩展名挑一个表情图标(纯装饰,缺省用 📄)。"""
+        ext = os.path.splitext(name or "")[1].lower()
+        return {
+            ".pdf": "📕", ".doc": "📘", ".docx": "📘",
+            ".xls": "📗", ".xlsx": "📗", ".csv": "📗",
+            ".ppt": "📙", ".pptx": "📙",
+            ".zip": "🗜️", ".tar": "🗜️", ".gz": "🗜️", ".7z": "🗜️", ".rar": "🗜️",
+            ".json": "🧾", ".jsonl": "🧾", ".parquet": "🧾",
+            ".md": "📝", ".txt": "📄", ".py": "🐍",
+        }.get(ext, "📄")
+
+    def _file_card(self, name):
+        """把一个文件渲染成气泡里的卡片(图标 + 文件名,白底黑描边圆角)。
+        长文件名按卡片宽度中部省略(…),不撑破气泡也不被硬截。
+        """
+        card = QLabel()
+        card.setWordWrap(False)
+        card.setStyleSheet(
+            "QLabel{background:#FFFFFF; color:#2B2B2B; border:2px solid #2B2B2B;"
+            f"border-radius:10px; padding:8px 12px; font-size:13px; font-family:{FONT};}}")
+        card.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        from PyQt6.QtGui import QFontMetrics
+        icon = self._file_icon(name)
+        # 卡片最大可用文字宽度 ≈ 气泡内宽(280-2*11 边距)再留图标/padding 余量
+        avail = 230
+        fm = QFontMetrics(card.font())
+        elided = fm.elidedText(name, Qt.TextElideMode.ElideMiddle, avail)
+        card.setText(f"{icon}  {elided}")
+        # 完整名挂 tooltip,鼠标悬停可看全名
+        if elided != name:
+            card.setToolTip(name)
+        return card
+
+    def _add_user_segments(self, segments):
+        """渲染【用户】的图文混排气泡:按段顺序竖排文本 QLabel + 缩略图,
+        下方一行时间戳 + 复制按钮(复制本条折叠纯文本)。返回容器载体。
+        """
+        plain = self._segments_plain(segments)
+        # 气泡容器(沿用用户气泡的蓝底黑描边圆角风;承载多段子部件)
+        bub = QFrame()
+        bub.setStyleSheet(
+            f"QFrame{{background:{config.COL_USER_BUBBLE};"
+            "border:2px solid #2B2B2B; border-radius:16px; border-top-right-radius:5px;}")
+        bub.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Minimum)
+        bub.setMaximumWidth(280)
+        inner = QVBoxLayout(bub)
+        inner.setContentsMargins(11, 10, 11, 10); inner.setSpacing(7)
+        for seg in segments:
+            if seg["type"] == "image":
+                inner.addWidget(self._img_thumb(seg["path"]))
+            elif seg["type"] == "file":
+                inner.addWidget(self._file_card(seg.get("name", "") or "附件"))
+            else:
+                t = QLabel()
+                t.setWordWrap(True)
+                t.setTextFormat(Qt.TextFormat.RichText)
+                import html as _h
+                safe = _h.escape(seg["text"].strip()).replace("\n", "<br>")
+                t.setText(f"<div style='line-height:150%;'>{safe}</div>")
+                t.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                t.setStyleSheet(
+                    f"QLabel{{color:{config.COL_USER_TEXT}; background:transparent;"
+                    f"border:none; font-size:14px; font-family:{FONT};}}")
+                inner.addWidget(t)
+        # 复制按钮取这条消息的折叠纯文本(_copy_button 读 source._raw_text)
+        bub._raw_text = plain
+
+        col = QVBoxLayout(); col.setContentsMargins(0, 0, 0, 0); col.setSpacing(1)
+        col.addWidget(bub)
+        meta = QHBoxLayout(); meta.setContentsMargins(0, 0, 0, 0); meta.setSpacing(2)
+        meta.addStretch()
+        meta.addWidget(self._copy_button(bub))
+        meta.addWidget(self._time_label("你"))
+        col.addLayout(meta)
+        col.setAlignment(bub, Qt.AlignmentFlag.AlignRight)
+        row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(); row.addLayout(col)
+        self.msgs.insertLayout(self.msgs.count() - 1, row)
+        QTimer.singleShot(30, self._scroll_bottom)
+        return bub
 
     def _add_thinking(self):
         """加一个【固定尺寸】的"正在想"气泡:转圈动画/读秒都不改变它的尺寸,
@@ -504,6 +934,7 @@ class ChatWindow(QWidget):
 
     def _busy(self, on):
         self.input.setEnabled(not on)
+        self.attach.setEnabled(not on)      # 等回复时也别让用户继续挂附件(下条再发)
         self.send.setVisible(not on)
         self.cancel.setVisible(on)
         if not on:
@@ -512,8 +943,13 @@ class ChatWindow(QWidget):
 
     # ---------- 发送 ----------
     def _send(self):
-        text = self.input.text().strip()
-        if not text:
+        raw = self.input.toPlainText()
+        # 把输入框内容(可能含「[图片 #n]」「[文件 #n]」占位)切成有序段
+        segments = self._parse_segments(raw)
+        has_attach = any(s["type"] in ("image", "file") for s in segments)
+        # 折叠纯文本表示:用于历史/流水/定时命令识别/降级回应(附件 → 占位文字)
+        plain = self._segments_plain(segments)
+        if not plain and not has_attach:
             return
         # 当前 worker 仍在跑:
         # - 未取消(用户没点 ✕,只是手快又发一句)→ 维持"一次只发一句",静默忽略。
@@ -527,9 +963,15 @@ class ChatWindow(QWidget):
             else:
                 return
         self.input.clear()
-        self._add("你", text)
-        # 先看是不是在管理定时任务(列出/删除/新建),命中就本地处理,不发 claude
-        if self._handle_schedule_command(text):
+        self._reset_pending()
+        # 渲染用户气泡:有附件走混排(缩略图/文件卡片),纯文本走原气泡(都带复制按钮)
+        if has_attach:
+            self._add_user_segments(segments)
+        else:
+            self._add("你", plain)
+        # 先看是不是在管理定时任务(列出/删除/新建)。【仅纯文本消息】参与快通道:
+        # 带附件的消息一律交给 claude 主对话,避免占位串进时间解析(定时命令几乎不带附件)。
+        if not has_attach and self._handle_schedule_command(plain):
             return
         # claude 不可用(没装 Claude Code / 不在 PATH):不起注定失败的 worker,
         # 皮卡丘改用拟声台词"出声"回应——既给即时反馈,又温和点明原因。复用
@@ -543,14 +985,22 @@ class ChatWindow(QWidget):
                 pika = f"{babble}\n\n{config.PIKA_NO_CLAUDE_HINT}"
             else:
                 pika = babble
-            self._say_local(text, pika)
+            # 带附件时额外点明"现在看不了":否则用户看到缩略图却得到拟声词,
+            # 会误以为皮卡丘看了图(其实没装 claude,根本没读)。
+            if has_attach:
+                pika += "\n\n(*盯着你发的东西* 皮卡丘现在还看不了图片/文件呢,"
+                pika += "得先装好 Claude Code 才行哦~)"
+            # 用户气泡已渲染,_say_local 只加皮卡丘气泡 + 把这一轮(plain)进历史/流水
+            self._say_local(plain, pika)
             return
         self._thinking = self._add_thinking()
         self._busy(True)
-        self._pending_user = text
+        # _pending_user 存折叠纯文本(_reply 写历史/流水用),worker 收完整 segments
+        self._pending_user = plain
         self.thinking_started.emit()        # 让桌宠本体进思考态
         recent = self._history[-12:]
-        w = ClaudeWorker(text, history=recent)
+        w = ClaudeWorker(plain, history=recent,
+                         segments=segments if has_attach else None)
         # 关键:lambda 捕获【发出信号的这个 worker 实例】,回调里比对 self._worker
         # 是否仍是它。否则——用户取消 A 后立刻发 B,self._worker 已换成 B,
         # A 的迟到 succeeded 会用 B 的 cancelled(False)通过守卫,把 A 的回复
