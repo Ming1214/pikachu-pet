@@ -3,8 +3,10 @@
 所有可调参数都放在这里,方便不动主逻辑就能改外观/行为。
 """
 
+import json
 import os
 import re
+import threading
 
 # ─────────────────────────────  路径  ─────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -132,6 +134,10 @@ CLAUDE_MULTI_TURN = True
 # 权限模式:auto = 智能判断安全性(安全放行/危险拦截),适合非交互桌宠。
 # 可选 "bypassPermissions"(全放行)/"acceptEdits"(只接受编辑,会卡)。
 CLAUDE_PERMISSION_MODE = "auto"
+# 模型:空串 = 不传 --model,跟随 claude CLI 自身配置(默认行为,零回归)。
+# 控制台可在线改成具体模型(如 claude-haiku-4-5 让后台整理/搭话降本);
+# 非空时 claude_bridge 给每次调用追加 --model。
+CLAUDE_MODEL = ""
 
 # ─────────────────────  危险操作三层确认(A 硬拦截 + B 软护栏 + C 透明)  ─────────────────────
 # auto 模式让 claude 自己判断安全性,没有用户确认环节(桌宠非交互)。万一它误判、
@@ -236,6 +242,9 @@ def _cleanup_garbage_paths():
         # 进程间临时态,退出清掉。注意【不删】DANGER_LOG_PATH(那是用户数据,保留)。
         CONFIRM_PENDING_PATH,
         PET_SETTINGS_PATH,
+        # Web 控制台访问令牌:启动随机生成的一次性信令,退出清(下次启动重新生成)。
+        # 注意【不删】CONFIG_OVERRIDES_PATH(用户配置,退出保留)。
+        WEB_CONSOLE_TOKEN_PATH,
     ]
     # 残留的决策文件 guardian_decision.<req_id>:正常用完会被 hook/桌宠删掉,异常退出
     # 可能残留,这里兜底清。用前缀通配,只清本目录这一族信令文件(决策文件无 pid 归属,
@@ -258,6 +267,9 @@ def _cleanup_garbage_paths():
     # 调用日志的轮转原子写残留:只清自己 pid 的 .tmp,不删 call_log.jsonl 本体
     # (用户数据,退出保留;理由同上 danger_ops / conversation)。
     paths += glob.glob(os.path.join(BASE_DIR, f"call_log.jsonl.{own}.tmp"))
+    # 配置覆盖文件的原子写残留:只清自己 pid 的 .tmp,不删 config_overrides.json 本体
+    # (用户配置,退出保留;理由同 scheduled_tasks.json)。
+    paths += glob.glob(os.path.join(BASE_DIR, f"config_overrides.json.{own}.tmp"))
     return paths
 
 # ── 首次引导(E1)──
@@ -322,6 +334,19 @@ PROACTIVE_MAX_PER_DAY = 6
 # 静默时段 [start, end):这段钟点内不主动打扰(夜里)。23 点到次日 8 点。
 PROACTIVE_QUIET_HOURS = (23, 8)
 
+# ─────────────────────────  本地 Web 控制台  ─────────────────────────
+# 一个跟桌宠【同进程】的后台 HTTP 线程:浏览器里实时看状态(动作/思考/各 worker/
+# 定时任务/记忆/调用日志/危险操作流水),并在线改配置(模型/开关/数值/人设/记忆)。
+# 只绑 127.0.0.1(仅本机)+ 随机 token,不对外暴露。默认开,可在此关。
+WEB_CONSOLE_ENABLED = True
+WEB_CONSOLE_HOST = "127.0.0.1"     # 死绑本机回环,绝不监听公网
+WEB_CONSOLE_PORT = 0               # 0 = 由系统分配空闲端口,启动后打印真实 url
+# 访问令牌文件:启动时随机生成写入(0600),浏览器访问需带 ?token=。运行时信令,退出清。
+WEB_CONSOLE_TOKEN_PATH = os.path.join(BASE_DIR, ".web_console_token")
+# 配置覆盖文件(用户数据,退出【保留】、不入库):控制台改的配置存这里,启动时
+# load_overrides() 覆盖回 config 模块属性。和 scheduled_tasks.json 同等待遇。
+CONFIG_OVERRIDES_PATH = os.path.join(BASE_DIR, "config_overrides.json")
+
 
 # 皮卡丘人设:像一只真的宠物,不是 AI 助手。
 PIKACHU_PERSONA = (
@@ -349,3 +374,77 @@ PIKACHU_PERSONA = (
     "问主人'要这么做吗?⚡',等主人这一轮明确说同意了,下一轮再真去做。"
     "普通操作(读文件、写文件、git commit、安装依赖、跑测试等)正常做,不用问。"
 )
+
+
+# ─────────────────────  配置覆盖(持久化 / 控制台改配置)  ─────────────────────
+# 控制台改的配置存进 config_overrides.json,启动时覆盖回本模块的常量。设计要点:
+#  - 只覆盖【本模块已存在】的大写常量(白名单式),杜绝注入任意属性。
+#  - tuple 类型常量(如 PROACTIVE_QUIET_HOURS)经 JSON 往返会变 list,这里转回 tuple,
+#    保持类型一致(下游 in_quiet_hours 解包 start,end 才不出错)。
+#  - 全程 try/except 静默:覆盖文件损坏/缺失都降级用源码默认,绝不让配置问题挡住启动。
+
+# 进程内锁:控制台可能从多个 HTTP 线程并发写配置。save_overrides 是"读全量→合并→
+# 写盘",两个线程各读旧 dict 各自合并会互相覆盖。控制台侧的 read-modify-write 用本锁
+# 包住(见 web_console._apply_config),保证同进程内配置写串行。供 web_console 持有。
+OVERRIDES_LOCK = threading.Lock()
+
+
+def load_overrides() -> None:
+    """把 config_overrides.json 覆盖到本模块属性。【必须在所有常量定义之后调用】。"""
+    try:
+        if not os.path.exists(CONFIG_OVERRIDES_PATH):
+            return
+        with open(CONFIG_OVERRIDES_PATH, encoding="utf-8") as f:
+            ov = json.load(f)
+        if not isinstance(ov, dict):
+            return
+        g = globals()
+        for k, v in ov.items():
+            if not (isinstance(k, str) and k.isupper() and k in g):
+                continue   # 只认已存在的大写常量,挡住任意键注入
+            # 原值是 tuple 而覆盖值是 list → 转回 tuple,保持类型
+            if isinstance(g[k], tuple) and isinstance(v, list):
+                v = tuple(v)
+            g[k] = v
+    except Exception:
+        pass
+
+
+def save_overrides(ov: dict) -> bool:
+    """原子写 config_overrides.json(pid tmp + os.replace),仿 _ensure_mcp_config。
+
+    ov 是【完整的当前覆盖集】(控制台每次提交都传全量),不是增量。失败返回 False。
+    """
+    try:
+        tmp = f"{CONFIG_OVERRIDES_PATH}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(ov, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_OVERRIDES_PATH)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def load_overrides_dict() -> dict:
+    """读出当前 config_overrides.json 的原始字典(控制台改某项前先读全量再合并)。"""
+    try:
+        if os.path.exists(CONFIG_OVERRIDES_PATH):
+            with open(CONFIG_OVERRIDES_PATH, encoding="utf-8") as f:
+                d = json.load(f)
+                if isinstance(d, dict):
+                    return d
+    except Exception:
+        pass
+    return {}
+
+
+# 启动即加载覆盖:放在文件【最末尾】,确保覆盖所有常量(含 PIKACHU_PERSONA),
+# 不会被后续定义重新盖回默认。
+load_overrides()

@@ -27,6 +27,7 @@
 import json
 import os
 import re
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -57,6 +58,21 @@ _TYPE_TITLE = {
 
 
 # ───────────────────────────  跨进程锁  ───────────────────────────
+# 按 lock_path 复用的进程内锁:同进程内同一文件的临界区串行化(flock 在同进程
+# 多线程间不互斥,见 _file_lock 文档)。用 dict 缓存,_registry_lock 保护其创建。
+_proc_locks: dict[str, threading.Lock] = {}
+_registry_lock = threading.Lock()
+
+
+def _proc_lock_for(lock_path: str) -> threading.Lock:
+    with _registry_lock:
+        lk = _proc_locks.get(lock_path)
+        if lk is None:
+            lk = threading.Lock()
+            _proc_locks[lock_path] = lk
+        return lk
+
+
 @contextmanager
 def _file_lock(lock_path: str):
     """跨进程排他锁(flock),保护 load→改→save 整段不被另一进程穿插。
@@ -67,29 +83,44 @@ def _file_lock(lock_path: str):
     关键:整个函数只能有【一处】会执行到的 yield(拿锁失败时单独 yield 后 return,
     拿到锁后只在一个 try/finally 里 yield 一次),否则 with 块体抛异常会撞上第二个
     yield → "generator didn't stop after throw()" RuntimeError 把原异常吞掉。
+
+    【同进程线程互斥】flock 是进程级锁,同一进程内多线程(Qt 主线程的 apply_digest
+    ↔ Web 控制台线程的记忆 CRUD)对同一文件再次 flock 不会阻塞 → 仍可能同时进临界区、
+    read-modify-write 互相覆盖。所以在 flock 之外【先持一把按 lock_path 区分的进程内
+    threading.Lock】:同进程内同一路径的临界区被串行化,跨进程靠 flock,两层叠加才真正
+    安全。对所有走 _file_lock 的调用点透明,无需各自改。
     """
-    if fcntl is None:
-        yield
-        return
-    lf = None
+    proc_lock = _proc_lock_for(lock_path)
+    proc_lock.acquire()
     try:
-        lf = open(lock_path, "w")
-        fcntl.flock(lf, fcntl.LOCK_EX)
-    except Exception:
-        if lf is not None:
+        if fcntl is None:
+            yield
+            return
+        lf = None
+        try:
+            lf = open(lock_path, "w")
+            fcntl.flock(lf, fcntl.LOCK_EX)
+        except Exception:
+            if lf is not None:
+                try:
+                    lf.close()
+                except OSError:
+                    pass
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+            except Exception:
+                pass
             try:
                 lf.close()
             except OSError:
                 pass
-        yield
-        return
-    try:
-        yield
     finally:
-        try:
-            fcntl.flock(lf, fcntl.LOCK_UN)
-        except Exception:
-            pass
+        proc_lock.release()
         lf.close()
 
 

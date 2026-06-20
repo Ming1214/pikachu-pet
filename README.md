@@ -192,7 +192,8 @@ python pet.py
 ## 🔒 隐私 & 安全边界
 
 - **聊天 = 调用本地 `claude` CLI**:你发的话、注入的记忆/历史,都交给你本机的 [Claude Code](https://claude.com/claude-code) 命令行处理。桌宠本身**不直连任何第三方服务器、不另设遥测**——数据外发的边界,就是你那套 `claude` 平时怎么联网,它就怎么联网(由你的 Claude Code 配置决定),桌宠不在中间偷加一层。
-- **用户数据全本地、退出保留**:定时任务、记忆库、对话流水、危险操作流水、调用日志(`scheduled_tasks.json` / `memory.json` / `memory.md` / `conversation.jsonl` / `danger_ops.jsonl` / `call_log.jsonl`)都只存在你本机,**不入版本库、退出不删**。
+- **用户数据全本地、退出保留**:定时任务、记忆库、对话流水、危险操作流水、调用日志、控制台配置(`scheduled_tasks.json` / `memory.json` / `memory.md` / `conversation.jsonl` / `danger_ops.jsonl` / `call_log.jsonl` / `config_overrides.json`)都只存在你本机,**不入版本库、退出不删**。
+- **本地控制台不对外**:Web 控制台只绑 `127.0.0.1`(仅本机回环)+ 随机 token,不监听公网;访问令牌 `.web_console_token` 是一次性信令,退出即清。
 - **调用日志只记元数据**:`call_log.jsonl` 每次调 claude 留一行——时间、类型、耗时、成败、prompt/回复**字数**,**绝不记聊天正文**(只记长度,既可观测又不泄隐私)。
 - **运行时垃圾才清**:退出只清自动生成的配置/信令/事件流水(`mcp_config.json` / `pet_settings.json` / `guardian_pending.jsonl` / 决策文件等),绝不碰用户数据。
 - **危险操作有底线**:不可逆操作受上面的三层确认把关,无人值守也不会静默跑高危命令。
@@ -243,6 +244,31 @@ python pet.py
 
 ---
 
+## 🖥️ 本地控制台
+
+一个跟桌宠**同进程**的小网页,在浏览器里实时盯状态、随手改配置——不用动代码、不用重启(大多数项)。
+
+**怎么开**:桌宠启动时终端会打印一行带 token 的链接,直接点开:
+
+```
+⚡ 皮卡丘控制台已启动:http://127.0.0.1:54321/?token=xxxxxxxx
+```
+
+**能看**(每 1.5s 刷新):当前动作 / 是否在思考 / 聊天窗开没开 / 各后台 worker 数 / 待确认危险操作 / 空闲与运行时长;定时任务、记忆库、调用日志、危险操作流水、对话流水。
+
+**能改**:
+- **模型** —— 给皮卡丘换脑(选便宜型号省钱,空=跟随 Claude Code 默认)
+- **权限模式 / 硬超时 / 周期任务是否自动执行**
+- **各功能开关**(记忆系统、主动搭话)与**视觉特效**、行为/动画/记忆调参
+- **皮卡丘人设(system prompt)** —— 改完下一句聊天就变性格
+- **记忆增 / 删 / 改** —— 手动教它记住、纠正、忘掉某件事
+
+改动**立即热生效**并存进 `config_overrides.json`(下次启动自动恢复);少数项(如总开关 `记忆系统`、动画帧间隔)受底层机制限制,面板会标「**需重启**」。点「恢复默认」可撤销某项覆盖。
+
+**安全边界**:只绑 `127.0.0.1`(仅本机,绝不监听公网)+ 启动随机生成的 token 校验,挡住同机其它程序/网页乱改。不想要它?`config.py` 里 `WEB_CONSOLE_ENABLED = False` 关掉即可。
+
+---
+
 ## 🎛️ 调教手册
 
 全在 **[`config.py`](config.py)**,挑几个常用的:
@@ -284,6 +310,9 @@ pikachu-pet/
 ├── pika_mcp.py       # MCP server:schedule / list / delete 工具
 ├── pika_guardian.py  # 危险操作守门 hook(PreToolUse):拦不可逆命令等用户确认
 ├── memory.py         # 记忆碎片引擎:对话流水 / 记忆库 / 老化淘汰 / md 导出
+├── web_console.py    # 本地 Web 控制台:状态监控 / 在线改配置 / 记忆增删改(同进程线程)
+├── web_console_page.py # 控制台内嵌前端(单页 HTML/JS,精灵球配色)
+├── config_schema.py  # 控制台可编辑配置项声明 + 校验(单一真相)
 ├── config.py         # 集中配置
 └── requirements.txt  # PyQt6 + mcp
 ```

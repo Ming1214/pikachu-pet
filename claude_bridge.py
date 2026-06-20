@@ -353,6 +353,11 @@ def ask_pikachu(
         # 注意:故意不加 --continue(会卡死)
     ]
 
+    # 模型:CLAUDE_MODEL 非空才传 --model;默认空 = 跟随 claude CLI 自身配置(零回归)。
+    # 控制台可在线改成便宜模型给后台任务降本。每次调用实时读 config,改了立刻生效。
+    if getattr(config, "CLAUDE_MODEL", ""):
+        cmd += ["--model", config.CLAUDE_MODEL]
+
     # 挂载定时任务 MCP 工具:让 claude 自主判断要不要建/查/删定时任务
     mcp_cfg = _ensure_mcp_config()
     if mcp_cfg:
@@ -480,6 +485,9 @@ def ask_raw(prompt: str, *, timeout_sec: int = 45,
         "--output-format", "json",
         # 不带人设、不需要工具权限,就是让它做一次文本推理
     ]
+    # 模型:同 ask_pikachu,非空才传(后台整理/搭话用便宜模型在此生效)。
+    if getattr(config, "CLAUDE_MODEL", ""):
+        cmd += ["--model", config.CLAUDE_MODEL]
     try:
         proc = subprocess.Popen(
             cmd, cwd=config.CLAUDE_WORKDIR, stdin=subprocess.DEVNULL,

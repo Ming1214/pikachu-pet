@@ -1875,6 +1875,62 @@ class PikachuPet(QWidget):
             return start <= h < end
         return h >= start or h < end      # 跨零点
 
+    # ---------- Web 控制台:内存态快照 ----------
+    def snapshot_state(self) -> dict:
+        """返回桌宠当前内存态的只读快照,供 Web 控制台展示。
+
+        线程安全:本方法被 web server 的 Python 线程调用,而这些属性由 Qt 主线程
+        并发读写。这里【只读不写】——对可变容器先 list() 浅拷贝再统计,绝不调
+        _alive_workers/_alive_memory_workers(它们会重建列表,有副作用,从别的线程
+        碰会和主线程打架)。读单个标量属性在 GIL 下是原子的;w.isRunning() 是 Qt
+        线程安全查询。全程 try/except 兜底,任一字段取失败都不影响整体快照。
+        """
+        def _alive(lst):
+            try:
+                return sum(1 for w in list(lst) if w.isRunning())
+            except Exception:
+                return 0
+        snap = {}
+        try:
+            snap["state"] = self._state
+            snap["thinking"] = bool(self._thinking_active)
+            snap["facing"] = "right" if self._walk_dir > 0 else "left"
+            snap["sched_workers"] = _alive(self._sched_workers)
+            snap["memory_workers"] = _alive(self._memory_workers)
+            snap["pending_confirms"] = len(self._pending_confirms)
+            snap["pending_results"] = len(self._pending_results)
+            snap["proactive_topics"] = len(self._proactive_topics)
+            snap["sticky_queue"] = len(self._sticky_queue)
+            # 危险确认细化:当前正显示哪条(命令文案)+ 排队待显示的条数 + 是否有常驻气泡
+            try:
+                act = self._active_confirm
+                snap["active_confirm"] = bool(act)
+                info = self._pending_confirms.get(act) if act else None
+                snap["active_confirm_cmd"] = (info or {}).get("command", "") if info else ""
+                snap["confirm_queue"] = len(self._confirm_order)
+            except Exception:
+                snap["active_confirm"] = False
+                snap["active_confirm_cmd"] = ""
+                snap["confirm_queue"] = 0
+            snap["bubble_sticky"] = bool(getattr(self, "_bubble_sticky", False))
+            snap["chat_open"] = self._chat_open()
+            # 聊天窗当前是否有 claude 在跑(正在回复)
+            try:
+                w = getattr(self._chat, "_worker", None) if self._chat else None
+                snap["chat_busy"] = bool(w is not None and w.isRunning())
+            except Exception:
+                snap["chat_busy"] = False
+            snap["in_quiet_hours"] = self._in_quiet_hours()
+            try:
+                snap["uptime_ms"] = int(self._t.elapsed())
+                snap["idle_ms"] = max(0, int(self._t.elapsed()) - int(self._last_interact))
+            except Exception:
+                snap["uptime_ms"] = 0
+                snap["idle_ms"] = 0
+        except Exception:
+            pass
+        return snap
+
     # ---------- 退出清理 ----------
     def shutdown(self):
         """退出前 cancel + join 所有在跑的 ClaudeWorker(QThread)。
@@ -1883,6 +1939,15 @@ class PikachuPet(QWidget):
         「QThread: Destroyed while thread is still running」甚至 abort,
         且底层 claude 子进程会变成孤儿。cancel 会 kill 子进程,wait 等线程收尾。
         """
+        # 先停 Web 控制台 server(不再接受请求,断开监听端口)。daemon 线程其实
+        # 进程退出即死,显式停更干净、避免端口残留。失败不致命。
+        try:
+            srv = getattr(self, "_web_server", None)
+            if srv is not None:
+                import web_console
+                web_console.stop(srv)
+        except Exception:
+            pass
         # 清零危险操作确认的硬超时暂停计数:退出时不再等任何人点确认,让仍在等的
         # claude 调用恢复正常超时/被下面的 cancel+killpg 干净杀掉(连 hook 子进程)。
         try:
@@ -2010,6 +2075,17 @@ def main():
     import threading
     threading.Thread(target=ensure_avatar, daemon=True).start()
     pet = PikachuPet()
+
+    # 启动本地 Web 控制台(同进程 daemon 线程):浏览器实时看状态 + 在线改配置/人设/记忆。
+    # 只绑 127.0.0.1 + token,不对外暴露。失败不致命(桌宠照常跑,只是没控制台)。
+    pet._web_server = None
+    if getattr(config, "WEB_CONSOLE_ENABLED", False):
+        try:
+            import web_console
+            pet._web_server = web_console.start(pet)
+        except Exception as exc:
+            print(f"[web console] 启动失败(非致命):{exc}")
+
     # 退出前清理在跑的 claude 线程/子进程,避免 QThread 崩溃与孤儿进程
     app.aboutToQuit.connect(pet.shutdown)
 

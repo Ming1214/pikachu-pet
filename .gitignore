@@ -37,6 +37,10 @@ scheduled_tasks.json.*.tmp
 .watchdog_pids
 # 首次引导标记
 .onboarded
+# Web 控制台:配置覆盖(用户数据,退出保留、不入库)+ 访问令牌(运行时信令,退出清)
+config_overrides.json
+config_overrides.json.*.tmp
+.web_console_token
 # 记忆碎片(用户数据):记忆库 + 自动导出的 md + 对话流水。退出保留、不入库。
 memory.json
 memory.md
