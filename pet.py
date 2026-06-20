@@ -62,10 +62,16 @@ class _ConfirmBubble(QWidget):
 
     def __init__(self, text, parent=None):
         super().__init__(parent)
-        # 整块红底圆角警示框(沿用 sticky 提醒的醒目红,区别于普通黄气泡)
+        # 关键:裸 QWidget 子类默认【不】绘制 styleSheet 里的 background,必须开
+        # WA_StyledBackground 才会按样式表画底色。否则父窗口是 WA_TranslucentBackground,
+        # 这个浮层的红底画不出来 → 警示文字直接浮在桌面上,花背景下看不清(只有
+        # QPushButton 自带背景绘制,所以之前只有两个按钮有底色)。
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # 整块红底圆角警示框(沿用 sticky 提醒的醒目红,区别于普通黄气泡)。
+        # 选择器限定到本类,避免样式继承到子 label/按钮(它们各自设了样式)。
         self.setStyleSheet(
-            "background: rgba(238,21,21,240); border:2px solid #FFE259;"
-            "border-radius:12px;")
+            "_ConfirmBubble { background: rgba(238,21,21,245);"
+            "border:2px solid #FFE259; border-radius:12px; }")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 8, 12, 10)
         lay.setSpacing(8)
