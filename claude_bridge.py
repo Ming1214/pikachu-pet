@@ -250,6 +250,63 @@ def _build_prompt(user_text: str, history: list[tuple[str, str]] | None) -> str:
     return "\n".join(lines)
 
 
+# 调用日志轮转计数:每写 N 行查一次行数、超限截断尾部。不每行都查(查行数要读
+# 全文件,频繁调用时浪费),用进程内计数器隔几十行抽查一次,廉价且足够。
+_call_log_lock = threading.Lock()
+_call_log_writes = 0
+
+
+def _truncate_call_log() -> None:
+    """调用日志超 CALL_LOG_MAX_LINES 时,只留尾部那么多行(原子写)。失败静默。"""
+    try:
+        path = config.CALL_LOG_PATH
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        cap = config.CALL_LOG_MAX_LINES
+        if len(lines) <= cap:
+            return
+        kept = lines[-cap:]
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _log_call(kind: str, started: float, ok: bool,
+              prompt_len: int, reply_len: int) -> None:
+    """给一次 claude 调用留一行元数据日志(不记正文,只记长度)。
+
+    kind: "chat"(带人设的聊天)/ "raw"(内部纯文本推理)。
+    started: 调用开始的 time.monotonic() 值,用来算耗时。
+    ok: 是否成功返回。prompt_len/reply_len: 输入/输出【字符数】(不是内容)。
+    全程 try/except 静默:日志只是可观测性,绝不能因写日志失败而影响聊天。
+    """
+    try:
+        from datetime import datetime
+        rec = {
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "kind": kind,
+            "elapsed": round(time.monotonic() - started, 2),
+            "ok": ok,
+            "prompt_chars": prompt_len,
+            "reply_chars": reply_len,
+        }
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        # 原子 append:多线程/多实例并发时,O_APPEND 保证每行不交错(单 write 原子)。
+        with _call_log_lock:
+            with open(config.CALL_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+            global _call_log_writes
+            _call_log_writes += 1
+            if _call_log_writes >= 50:
+                _call_log_writes = 0
+                _truncate_call_log()
+    except Exception:
+        pass
+
+
 def ask_pikachu(
     prompt: str,
     *,
@@ -267,6 +324,9 @@ def ask_pikachu(
         ClaudeError: claude 不可用、超时、被取消或返回错误时。
     """
     full_prompt = _build_prompt(prompt, history)
+    # 调用日志打点:记开始时刻与 prompt 长度,出口处(成功/失败)统一写一行元数据。
+    _t0 = time.monotonic()
+    _plen = len(full_prompt)
     persona = config.PIKACHU_PERSONA + "\n\n" + _scheduling_hint()
     # 注入长期记忆:让皮卡丘"记得"主人(在学什么、喜好、没做完的事…),
     # 自然体现在对话里。失败/无记忆则不注入,绝不影响聊天。
@@ -322,6 +382,7 @@ def ask_pikachu(
             start_new_session=True,
         )
     except FileNotFoundError as exc:
+        _log_call("chat", _t0, False, _plen, 0)
         raise ClaudeError(
             f"找不到 `{config.CLAUDE_BIN}` 命令,确认 Claude Code 已安装并在 PATH 中。"
         ) from exc
@@ -359,6 +420,7 @@ def ask_pikachu(
         if cancel_event is not None and cancel_event.is_set():
             _kill_proc_tree(proc)        # killpg 连 hook 子进程一起杀,不残留阻塞
             done.wait(timeout=3)
+            _log_call("chat", _t0, False, _plen, 0)
             raise ClaudeError("已取消~")
         # 危险操作确认暂停:hook 拦截后桌宠会 begin_await(),此刻 claude 子进程正阻塞在
         # hook 里等用户点确认。把 deadline 持续后移,使这段"等人"时间不计入硬超时——
@@ -372,6 +434,7 @@ def ask_pikachu(
     if timed_out:
         _kill_proc_tree(proc)
         done.wait(timeout=3)
+        _log_call("chat", _t0, False, _plen, 0)
         raise ClaudeError(
             f"皮卡丘想了太久(超过 {config.CLAUDE_TIMEOUT_SEC} 秒)…可以让它做小一点的任务。"
         )
@@ -381,19 +444,23 @@ def ask_pikachu(
 
     if proc.returncode != 0:
         detail = (stderr or stdout or "未知错误").strip()
+        _log_call("chat", _t0, False, _plen, 0)
         raise ClaudeError(f"皮卡丘卡住了:{detail[:300]}")
 
     reply = ""
     try:
         data = json.loads(stdout)
         if data.get("is_error"):
+            _log_call("chat", _t0, False, _plen, 0)
             raise ClaudeError(f"皮卡丘报错了:{str(data.get('result', '未知错误'))[:300]}")
         reply = (data.get("result") or "").strip()
     except json.JSONDecodeError:
         reply = stdout.strip()
 
     if not reply:
+        _log_call("chat", _t0, False, _plen, 0)
         raise ClaudeError("皮卡丘张了张嘴,但什么也没说出来(空回复)。")
+    _log_call("chat", _t0, True, _plen, len(reply))
     return reply
 
 
@@ -404,6 +471,9 @@ def ask_raw(prompt: str, *, timeout_sec: int = 45,
     返回 claude 的纯文本回复。失败抛 ClaudeError。
     不需要文件/命令权限,纯推理。
     """
+    # 调用日志打点(kind=raw):记开始时刻与 prompt 长度,出口处统一写一行元数据。
+    _t0 = time.monotonic()
+    _plen = len(prompt)
     cmd = [
         config.CLAUDE_BIN,
         "-p", prompt,
@@ -418,6 +488,7 @@ def ask_raw(prompt: str, *, timeout_sec: int = 45,
             start_new_session=True,
         )
     except FileNotFoundError as exc:
+        _log_call("raw", _t0, False, _plen, 0)
         raise ClaudeError("找不到 claude 命令") from exc
 
     _register_proc(proc)
@@ -442,19 +513,24 @@ def ask_raw(prompt: str, *, timeout_sec: int = 45,
     while time.monotonic() < deadline:
         if cancel_event is not None and cancel_event.is_set():
             _kill_proc_tree(proc); done.wait(timeout=3)
+            _log_call("raw", _t0, False, _plen, 0)
             raise ClaudeError("已取消")
         if done.wait(timeout=0.3):
             timed_out = False
             break
     if timed_out:
         _kill_proc_tree(proc); done.wait(timeout=3)
+        _log_call("raw", _t0, False, _plen, 0)
         raise ClaudeError("解析超时")
 
     stdout = holder.get("out", "") or ""
     if proc.returncode != 0:
+        _log_call("raw", _t0, False, _plen, 0)
         raise ClaudeError((holder.get("err") or stdout or "未知错误").strip()[:200])
     try:
         data = json.loads(stdout)
-        return (data.get("result") or "").strip()
+        reply = (data.get("result") or "").strip()
     except json.JSONDecodeError:
-        return stdout.strip()
+        reply = stdout.strip()
+    _log_call("raw", _t0, True, _plen, len(reply))
+    return reply

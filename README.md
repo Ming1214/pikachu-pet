@@ -191,7 +191,9 @@ python pet.py
 
 ## 🔒 隐私 & 安全边界
 
-- **用户数据全本地、退出保留**:定时任务、记忆库、对话流水、危险操作流水(`scheduled_tasks.json` / `memory.json` / `memory.md` / `conversation.jsonl` / `danger_ops.jsonl`)都只存在你本机,**不入版本库、退出不删**。
+- **聊天 = 调用本地 `claude` CLI**:你发的话、注入的记忆/历史,都交给你本机的 [Claude Code](https://claude.com/claude-code) 命令行处理。桌宠本身**不直连任何第三方服务器、不另设遥测**——数据外发的边界,就是你那套 `claude` 平时怎么联网,它就怎么联网(由你的 Claude Code 配置决定),桌宠不在中间偷加一层。
+- **用户数据全本地、退出保留**:定时任务、记忆库、对话流水、危险操作流水、调用日志(`scheduled_tasks.json` / `memory.json` / `memory.md` / `conversation.jsonl` / `danger_ops.jsonl` / `call_log.jsonl`)都只存在你本机,**不入版本库、退出不删**。
+- **调用日志只记元数据**:`call_log.jsonl` 每次调 claude 留一行——时间、类型、耗时、成败、prompt/回复**字数**,**绝不记聊天正文**(只记长度,既可观测又不泄隐私)。
 - **运行时垃圾才清**:退出只清自动生成的配置/信令/事件流水(`mcp_config.json` / `pet_settings.json` / `guardian_pending.jsonl` / 决策文件等),绝不碰用户数据。
 - **危险操作有底线**:不可逆操作受上面的三层确认把关,无人值守也不会静默跑高危命令。
 - **周期任务默认不自动干活**:`ALLOW_INTERVAL_ACTION=False`——周期 `action` 任务降级为「到点提醒你手动确认」,避免无人值守下反复执行高危操作。

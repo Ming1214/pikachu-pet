@@ -169,6 +169,14 @@ GUARDIAN_PATH = os.path.join(BASE_DIR, "pika_guardian.py")       # hook 脚本
 # 危险操作流水(用户数据,退出【保留】,和 conversation.jsonl 同等待遇):每次命中留痕,可事后查
 DANGER_LOG_PATH = os.path.join(BASE_DIR, "danger_ops.jsonl")
 
+# ── 轻量调用日志(可观测性)──
+# 每次调 claude(聊天 / 内部纯文本推理)留一行 JSON,记【元数据】不记正文:
+# 时间、类型(chat/raw)、耗时秒、成败、prompt 字数、回复字数。用于事后看
+# "皮卡丘忙不忙、慢不慢、有没有失败",排查体验问题。【只记长度不记内容】——
+# 既可观测又不泄露聊天隐私。属【用户数据】:退出【保留】、不入版本库。
+CALL_LOG_PATH = os.path.join(BASE_DIR, "call_log.jsonl")
+CALL_LOG_MAX_LINES = 1000   # 超出按尾部 N 行截断,防无限增长(轮转时机见 claude_bridge)
+
 
 def is_danger_command(command: str) -> bool:
     """判断一条 shell 命令是否命中危险清单。主程序与 hook 脚本共用,确保判定一致。"""
@@ -247,6 +255,9 @@ def _cleanup_garbage_paths():
     paths += glob.glob(os.path.join(BASE_DIR, f"memory.json.{own}.tmp"))
     paths += glob.glob(os.path.join(BASE_DIR, f"memory.md.{own}.tmp"))
     paths += glob.glob(os.path.join(BASE_DIR, f"conversation.jsonl.{own}.tmp"))
+    # 调用日志的轮转原子写残留:只清自己 pid 的 .tmp,不删 call_log.jsonl 本体
+    # (用户数据,退出保留;理由同上 danger_ops / conversation)。
+    paths += glob.glob(os.path.join(BASE_DIR, f"call_log.jsonl.{own}.tmp"))
     return paths
 
 # ── 首次引导(E1)──
