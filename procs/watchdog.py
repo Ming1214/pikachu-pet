@@ -100,8 +100,12 @@ def spawn_watchdog() -> int | None:
 
 if __name__ == "__main__":
     # 子进程入口:argv[1] 是继承来的读端 fd。在它上面等 EOF 后清理。
-    # 让本目录可 import cleanup/config。
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    # 本脚本在 procs/,cleanup/config 在 core/。把【项目根】及源码子目录加入
+    # sys.path,确保 _watchdog_loop 内 `import cleanup`(它再 import config)可达。
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for _sub in ("core", "agent", "ui", "web"):
+        sys.path.insert(0, os.path.join(_ROOT, _sub))
+    sys.path.insert(0, _ROOT)
     try:
         _fd = int(sys.argv[1])
     except (IndexError, ValueError):

@@ -238,7 +238,7 @@ python pet.py
 - **主动搭话有分寸** — 五重本地频率门:静默时段(默认 23:00–08:00)不打扰、你刚操作过不打断、两次间隔/每日上限都受限,**门全过才真去调 claude**(绝大多数轮次零开销)。claude 只「提议」话题,要不要真打扰由本地把关。
 - **四类搭话依据** — ① 没做完的事 ② 时间/作息关怀 ③ 兴趣话题延续 ④ 纯陪伴。
 
-记忆数据(`memory.json` / `memory.md` / `conversation.jsonl`)都是**你的私人数据**,不入库、退出保留。整套存储引擎在 [`memory.py`](memory.py),沿用定时任务同款 flock 跨进程锁 + 原子写。
+记忆数据(`memory.json` / `memory.md` / `conversation.jsonl`)都是**你的私人数据**,不入库、退出保留。整套存储引擎在 [`core/memory.py`](core/memory.py),沿用定时任务同款 flock 跨进程锁 + 原子写。
 
 > **没装 Claude Code 也不崩** — 此时皮卡丘聊天会用拟声词回你(「皮卡皮卡~⚡」)并温和提示去装 Claude Code,后台整理/主动搭话自动跳过、不空转。装好重启即恢复全部能力。
 
@@ -271,7 +271,7 @@ python pet.py
 
 ## 🎛️ 调教手册
 
-全在 **[`config.py`](config.py)**,挑几个常用的:
+全在 **[`core/config.py`](core/config.py)**,挑几个常用的:
 
 ```python
 ASCII_FONT_PX        = 22       # 字号(皮卡丘大小)
@@ -299,22 +299,38 @@ CLAUDE_PERMISSION_MODE = "auto"                  # 权限模式
 
 ## 🗂️ 项目结构
 
+源码按职能分进子目录(`pet.py` 留在根目录,运行命令仍是 `python pet.py`):
+
 ```
 pikachu-pet/
-├── pet.py            # 主程序:窗口 / 状态机 / 动画 / 特效 / 拖拽 / 托盘
-├── ascii_pika.py     # 帧库:15 状态 × 4 帧,统一对齐
-├── chat_window.py    # 聊天窗(精灵球主题)+ 后台 claude 线程
-├── claude_bridge.py  # claude CLI 封装 + 人设注入 + 多轮历史
-├── macos_window.py   # macOS 全 Space 常驻窗口层级
-├── scheduler.py      # 定时任务存储 / 触发 / 自然语言后备解析
-├── pika_mcp.py       # MCP server:schedule / list / delete 工具
-├── pika_guardian.py  # 危险操作守门 hook(PreToolUse):拦不可逆命令等用户确认
-├── memory.py         # 记忆碎片引擎:对话流水 / 记忆库 / 老化淘汰 / md 导出
-├── web_console.py    # 本地 Web 控制台:状态监控 / 在线改配置 / 记忆增删改(同进程线程)
-├── web_console_page.py # 控制台内嵌前端(单页 HTML/JS,精灵球配色)
-├── config_schema.py  # 控制台可编辑配置项声明 + 校验(单一真相)
-├── config.py         # 集中配置
-└── requirements.txt  # PyQt6 + mcp
+├── pet.py                  # 主程序入口:窗口 / 状态机 / 动画 / 特效 / 拖拽 / 托盘
+│
+├── core/                   # 配置 + 数据层(被各层依赖,无向上依赖)
+│   ├── config.py           #   集中配置(所有路径常量基于项目根)
+│   ├── config_schema.py    #   控制台可编辑配置项声明 + 校验(单一真相)
+│   ├── memory.py           #   记忆碎片引擎:对话流水 / 记忆库 / 老化淘汰 / md 导出
+│   ├── scheduler.py        #   定时任务存储 / 触发 / 自然语言后备解析
+│   └── cleanup.py          #   退出清理:杀子进程 + 删运行时垃圾(保留用户数据)
+│
+├── ui/                     # Qt 视图层
+│   ├── ascii_pika.py       #   帧库:15 状态 × 4 帧,统一对齐
+│   ├── chat_window.py      #   聊天窗(精灵球主题)+ 后台 claude 线程
+│   └── macos_window.py     #   macOS 全 Space 常驻窗口层级
+│
+├── agent/                  # Claude CLI 集成
+│   └── claude_bridge.py    #   claude CLI 封装 + 人设注入 + 多轮历史 + 模型/调用日志
+│
+├── web/                    # 本地 Web 控制台(同进程后台线程)
+│   ├── web_console.py      #   状态监控 / 在线改配置 / 记忆增删改;仅绑 127.0.0.1 + token
+│   └── web_console_page.py #   控制台内嵌前端(单页 HTML/JS,精灵球配色)
+│
+├── procs/                  # 被外部独立拉起的子进程脚本
+│   ├── pika_mcp.py         #   MCP server:schedule / list / delete 工具(claude 经 stdio 拉起)
+│   ├── pika_guardian.py    #   危险操作守门 hook(PreToolUse):拦不可逆命令等用户确认
+│   └── watchdog.py         #   看门狗:主进程死亡(含 kill -9)后兜底清理系统状态
+│
+├── assets/                 # 显示素材(pikachu_stand.svg 主显示 + pikachu_hd_main.png 头像)
+└── requirements.txt        # PyQt6 + mcp
 ```
 
 ---

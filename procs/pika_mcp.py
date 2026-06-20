@@ -17,8 +17,12 @@ import os
 import sys
 import time
 
-# 让本文件能 import 同目录的 scheduler/config(MCP 由 claude 以任意 cwd 拉起)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# MCP 由 claude 以任意 cwd 拉起。本脚本在 procs/,scheduler/config 在 core/。
+# 把【项目根】及各源码子目录加入 sys.path,确保能 import 到 scheduler(它再 import config)。
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _sub in ("core", "agent", "ui", "web"):
+    sys.path.insert(0, os.path.join(_ROOT, _sub))
+sys.path.insert(0, _ROOT)
 
 import scheduler  # noqa: E402
 

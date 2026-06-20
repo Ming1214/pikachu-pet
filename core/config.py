@@ -9,7 +9,11 @@ import re
 import threading
 
 # ─────────────────────────────  路径  ─────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# config.py 在 core/ 子目录;BASE_DIR 须指【项目根】(上一级),这样所有用户数据
+# 文件(memory.json / conversation.jsonl / scheduled_tasks.json 等)和 assets/ 仍
+# 落在项目根,不会因源码整理进子目录而搬家或散进 core/。两次 dirname:
+#   __file__(core/config.py)→ core/ → 项目根
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 
 # 主素材:Dream World 矢量站立插画(SVG,自然正面站姿,可无限放大不失真)
@@ -171,7 +175,7 @@ CONFIRM_DECISION_PREFIX = os.path.join(BASE_DIR, "guardian_decision.")
 CONFIRM_HOOK_TIMEOUT_SEC = 280     # hook 阻塞等确认的上限(< CLAUDE_TIMEOUT_SEC=500,留余量)
 CONFIRM_POLL_INTERVAL_MS = 800     # 桌宠轮询 pending 文件的间隔
 PET_SETTINGS_PATH = os.path.join(BASE_DIR, "pet_settings.json")  # 自动生成,经 --settings 挂 hook
-GUARDIAN_PATH = os.path.join(BASE_DIR, "pika_guardian.py")       # hook 脚本
+GUARDIAN_PATH = os.path.join(BASE_DIR, "procs", "pika_guardian.py")  # hook 脚本(procs/ 子目录)
 # 危险操作流水(用户数据,退出【保留】,和 conversation.jsonl 同等待遇):每次命中留痕,可事后查
 DANGER_LOG_PATH = os.path.join(BASE_DIR, "danger_ops.jsonl")
 
@@ -207,7 +211,7 @@ PIKA_NO_CLAUDE_HINT = (
 )
 
 # ── 定时任务 MCP 工具(让 claude 自主判断要不要建/查/删定时任务)──
-MCP_SERVER_PATH = os.path.join(BASE_DIR, "pika_mcp.py")
+MCP_SERVER_PATH = os.path.join(BASE_DIR, "procs", "pika_mcp.py")  # MCP server(procs/ 子目录)
 MCP_CONFIG_PATH = os.path.join(BASE_DIR, "mcp_config.json")  # 自动生成
 # 放行皮卡丘定时任务工具(mcp__<server名>__<工具名>)
 MCP_ALLOWED_TOOLS = [

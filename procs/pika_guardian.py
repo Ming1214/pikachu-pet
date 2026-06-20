@@ -46,9 +46,13 @@ def _emit(decision: str, reason: str = "") -> None:
         pass
 
 
-# 由 claude 以任意 cwd 拉起,确保能 import 同目录的 config(危险清单单一真相在那里)。
+# 由 claude 以任意 cwd 拉起。本脚本在 procs/ 子目录,而 config 在 core/。把【项目根】
+# 及各源码子目录加入 sys.path,确保能 import 到 config(危险清单单一真相在那里)。
 # 导入失败 → 拿不到危险清单,无法判断安全性 → 保守 deny(宁可拦错,不可放过)。
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _sub in ("core", "agent", "ui", "web"):
+    sys.path.insert(0, os.path.join(_ROOT, _sub))
+sys.path.insert(0, _ROOT)
 try:
     import config  # noqa: E402
 except Exception:

@@ -18,6 +18,16 @@ import sys
 import time
 import urllib.request
 
+# 源码按职能分进子目录(core/ui/agent/web/procs),pet.py 留在项目根。
+# 把这些子目录加入 sys.path,使下面 `import config / ascii_pika / claude_bridge /
+# web_console` 等裸名 import(以及函数内 `import cleanup / watchdog`)继续可达,
+# 无需把每处 import 改成带包名。必须在任何本地模块 import 之前执行。
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+for _sub in ("core", "ui", "agent", "web", "procs"):
+    _p = os.path.join(_ROOT, _sub)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from PyQt6.QtCore import Qt, QTimer, QPoint, QElapsedTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction, QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPixmap,
