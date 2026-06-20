@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 import claude_bridge
 import config
 import macos_window
+import memory
 import scheduler
 
 FONT = config.FONT_STACK
@@ -193,6 +194,8 @@ class ChatWindow(QWidget):
         # 定宽"正在想"气泡引用:_add_thinking 时赋值、_release_thinking 时清空。
         # 这里先初始化,免得 _render_thinking 在赋值前被调到要靠 getattr 兜底。
         self._thinking_fixed = None
+        # "正在想"气泡下方的时间戳 QLabel:回复完成时刷新成回复时刻(而非提问时刻)。
+        self._thinking_time = None
         self._pending_user = ""
         self._history = []
         # 桌宠本体回调:快通道本地建任务后冒"已记下"确认气泡(与 MCP 路径一致)。
@@ -376,7 +379,10 @@ class ChatWindow(QWidget):
         row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
         col = QVBoxLayout(); col.setContentsMargins(0, 0, 0, 0); col.setSpacing(1)
         col.addWidget(b)
-        col.addWidget(self._time_label("皮卡"))
+        # 时间戳此刻显示的是"提问时刻",但真正有意义的是【回复完成时刻】——
+        # 留个引用,等 _reply/_error 回复落定时刷新成那一刻(见 _stamp_thinking_time)。
+        self._thinking_time = self._time_label("皮卡")
+        col.addWidget(self._thinking_time)
         col.setAlignment(b, Qt.AlignmentFlag.AlignLeft)
         row.addLayout(col); row.addStretch()
         self.msgs.insertLayout(self.msgs.count() - 1, row)
@@ -646,6 +652,30 @@ class ChatWindow(QWidget):
         d = re.sub(r"^皮卡丘[,，、\s]*", "", d).strip()
         return d
 
+    def inject_pika_opening(self, text):
+        """主动搭话:把皮卡丘的一句开场白写进聊天窗(显示气泡 + 进历史 + 落流水),
+
+        让用户点开主动气泡后,聊天窗里已经有皮卡丘先开了口,可直接接着聊,
+        且后续多轮上下文连贯(进了 self._history)。供 pet 在主动搭话点击后调用。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        self._add("皮卡", text)
+        self._history.append(("皮卡丘", text))
+        self._log_convo("pika", text)
+        QTimer.singleShot(30, self._scroll_bottom)
+
+    @staticmethod
+    def _log_convo(role, text):
+        """把一句对话落盘到记忆流水(整理记忆的原料)。失败绝不影响聊天。"""
+        if not config.MEMORY_ENABLED:
+            return
+        try:
+            memory.append_convo(role, text)
+        except Exception:
+            pass
+
     def _say_local(self, user_text, pika_text):
         """快通道(本地处理,不发 claude)时:显示皮卡丘气泡 + 把这一轮记进历史。
 
@@ -655,6 +685,9 @@ class ChatWindow(QWidget):
         self._add("皮卡", pika_text)
         self._history.append(("我", user_text))
         self._history.append(("皮卡丘", pika_text))
+        # 落盘到记忆流水:本地处理的轮次也是真实对话,要进整理原料
+        self._log_convo("user", user_text)
+        self._log_convo("pika", pika_text)
 
     # 思考转圈动画帧:盲文旋转点(单字符等宽,旋转不改变气泡尺寸,流畅好看)
     _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -682,6 +715,15 @@ class ChatWindow(QWidget):
             b.setMaximumHeight(16777215)
             b.setWordWrap(True)
             self._thinking_fixed = None
+        # 把"正在想"气泡的时间戳刷新成【回复落定的此刻】(原先写死的是提问时刻,
+        # 皮卡丘想了几十秒,标提问时间会让人以为秒回 / 时序错乱)。
+        if self._thinking_time is not None:
+            from datetime import datetime
+            try:
+                self._thinking_time.setText(datetime.now().strftime("%H:%M"))
+            except RuntimeError:
+                pass                         # label 已随气泡销毁则忽略
+            self._thinking_time = None
         self.thinking_ended.emit()          # 让桌宠本体退出思考态
 
     def _reply(self, text, sender=None):
@@ -700,6 +742,9 @@ class ChatWindow(QWidget):
             self._add("皮卡", text)
         self._history.append(("我", self._pending_user))
         self._history.append(("皮卡丘", text))
+        # 落盘到记忆流水(整理记忆的原料)
+        self._log_convo("user", self._pending_user)
+        self._log_convo("pika", text)
         self._busy(False)
         QTimer.singleShot(30, self._scroll_bottom)
         self._notify_if_hidden(ok=True)
@@ -720,6 +765,8 @@ class ChatWindow(QWidget):
         if self._pending_user:
             self._history.append(("我", self._pending_user))
             self._history.append(("皮卡丘", "(没能回应,出错了)"))
+            # 只落用户这句:皮卡丘没答上来,记下用户说了啥即可(整理时它能看到)
+            self._log_convo("user", self._pending_user)
         self._busy(False)
         self._notify_if_hidden(ok=False)
 

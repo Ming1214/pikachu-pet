@@ -11,9 +11,11 @@
 
 import os
 import random
+import re
 import ssl
 import subprocess
 import sys
+import time
 import urllib.request
 
 from PyQt6.QtCore import Qt, QTimer, QPoint, QElapsedTimer, pyqtSignal
@@ -35,10 +37,40 @@ class _ClickBubble(QLabel):
         super().mousePressEvent(event)
 
 import ascii_pika
+import claude_bridge
 import config
 import macos_window
+import memory
 import scheduler
 from chat_window import ChatWindow, ClaudeWorker
+
+
+# ════════════════════════  后台记忆整理 worker  ════════════════════════
+class _DigestWorker(ClaudeWorker):
+    """后台整理记忆 + 判断要不要主动搭话的 worker(独立 QThread,不阻塞 UI)。
+
+    继承 ClaudeWorker 复用其线程/取消/保活范式,但 run() 改为调 claude_bridge.ask_raw
+    做【纯文本推理】(整理记忆不需要 MCP 工具/文件权限),把 claude 返回的原始
+    文本通过 succeeded 信号发回主线程,由主线程解析 JSON 并落盘(IO 留在主线程,
+    避免在子线程里碰记忆文件与 UI)。new_cursor 随 worker 携带,完成时一并交回。
+    """
+
+    def __init__(self, prompt, new_cursor):
+        super().__init__(prompt, history=None)
+        self.new_cursor = new_cursor
+
+    def run(self):
+        try:
+            reply = claude_bridge.ask_raw(
+                self._prompt, timeout_sec=60, cancel_event=self._cancel)
+            if not self._cancel.is_set():
+                self.succeeded.emit(reply)
+        except claude_bridge.ClaudeError as exc:
+            if not self._cancel.is_set():
+                self.failed.emit(str(exc))
+        except Exception as exc:
+            if not self._cancel.is_set():
+                self.failed.emit(f"整理出错:{exc}")
 
 
 # ════════════════════════  素材(仅头像,给聊天窗用)  ════════════════════════
@@ -103,6 +135,13 @@ class PikachuPet(QWidget):
         # 等用户打开聊天窗再补写进去——否则只冒"✅完成"气泡、结果丢失,
         # 用户永远不知道到底做了啥、做对没。[(desc, reply, ok)]
         self._pending_results = []
+        # 记忆整理后台 worker(保活防 GC,类比 _sched_workers)。
+        self._memory_workers = []
+        # 主动搭话:记录所有【尚未被点开】的主动话题文本(可能多条同时排在 sticky
+        # 队列里)。点击某条 sticky 气泡时,据此判断它是不是主动搭话——是则开聊天窗
+        # 接话题,否则按普通提醒"确认"。用 set 而非单槽:否则第二条主动话题会覆盖
+        # 第一条,导致还排在队首的第一条被点击时认不出、当成普通提醒静默关掉、不开窗。
+        self._proactive_topics = set()
         self._t = QElapsedTimer()
         self._t.start()
 
@@ -507,9 +546,22 @@ class PikachuPet(QWidget):
     def _on_bubble_clicked(self):
         # 点击 sticky 气泡 = 确认当前这条 → 弹出队列里的下一条(没有则收起)
         if self._bubble_sticky:
+            # 主动搭话气泡:当前队首正是主动话题 → 点击=展开聊天窗接着聊,
+            # 而不是单纯"确认"。先把它出队/收起,再开窗注入开场白。
+            head = self._sticky_queue[0] if self._sticky_queue else None
+            is_proactive = head is not None and head in self._proactive_topics
             if self._sticky_queue:
                 self._sticky_queue.pop(0)
             self._show_next_sticky()
+            if is_proactive:
+                self._proactive_topics.discard(head)
+                self._last_interact = self._t.elapsed()
+                self.open_chat()
+                if self._chat is not None:
+                    try:
+                        self._chat.inject_pika_opening(head)
+                    except Exception:
+                        pass
 
     # ---------- 托盘 ----------
     def _build_menu(self):
@@ -573,6 +625,13 @@ class PikachuPet(QWidget):
         # 让新用户发现核心功能(单击只逗一下,不开聊天,容易以为没反应)。
         if not os.path.exists(config.FIRST_RUN_FLAG):
             QTimer.singleShot(config.ONBOARD_DELAY_MS, self._maybe_onboard)
+
+        # 记忆整理 + 主动搭话:每 DIGEST_INTERVAL_MS 轮询一次。无新对话则跳过
+        # (零 claude 调用)。整理在后台 QThread 跑,完成后回主线程落盘 + 可能搭话。
+        if config.MEMORY_ENABLED:
+            self._digest_timer = QTimer(self)
+            self._digest_timer.timeout.connect(self._check_memory)
+            self._digest_timer.start(config.DIGEST_INTERVAL_MS)
 
     def _maybe_onboard(self):
         """首次引导气泡(只弹一次,靠标记文件去重)。"""
@@ -1008,6 +1067,194 @@ class PikachuPet(QWidget):
         if self._state == "think":
             self._set_state("idle", 1500)   # 短暂 idle 后自然进入随机玩耍
 
+    # ---------- 记忆整理 + 主动搭话 ----------
+    def _alive_memory_workers(self):
+        """清理已结束的整理 worker,返回仍在跑的数量(并发护栏用)。"""
+        self._memory_workers = [w for w in self._memory_workers if w.isRunning()]
+        return len(self._memory_workers)
+
+    def _check_memory(self):
+        """轮询入口:有新对话才整理(否则零开销);整理在后台线程跑。"""
+        if not config.MEMORY_ENABLED:
+            return
+        # 并发护栏:同一时刻只允许 1 个整理 worker,避免轮询叠加起多个 claude。
+        if self._alive_memory_workers() > 0:
+            return
+        # 注意:【不】在这里调 maybe_truncate_convo —— 它持 flock + fsync(还嵌套
+        # 取 MEMORY 锁),在 UI 线程同步执行会卡顿。截断放到 worker 完成后(见
+        # _on_digest_done),那时游标已推进,截断丢弃的都是整理过的旧对话,安全。
+        try:
+            data = memory.load_memory()
+            cursor = int(data.get("convo_cursor", 0))
+            # 限制每轮最多整理 N 行:read_new_convo 只返回最早的 N 行,且 new_cursor
+            # 精确指向这 N 行的末尾——剩余行下一轮继续读,绝不被游标跳过而丢失。
+            rows, new_cursor = memory.read_new_convo(
+                cursor, max_lines=config.DIGEST_MAX_CONVO_LINES)
+        except Exception as exc:
+            print(f"[pet] 读取对话流水失败,跳过本轮整理:{exc}")
+            return
+        if not rows:
+            return                                # 无新对话 → 跳过,不调 claude
+        prompt = self._build_digest_prompt(rows, data.get("memories", []))
+        worker = _DigestWorker(prompt, new_cursor)
+        worker.succeeded.connect(lambda r, w=worker: self._on_digest_done(w, r))
+        worker.failed.connect(lambda e, w=worker: self._on_digest_fail(w, e))
+        worker.finished.connect(
+            lambda w=worker: self._memory_workers.remove(w)
+            if w in self._memory_workers else None)
+        self._memory_workers.append(worker)
+        worker.start()
+
+    @staticmethod
+    def _build_digest_prompt(rows, existing):
+        """拼出"整理记忆 + 判断要不要主动搭话"的 prompt,要求 claude 只输出 JSON。
+
+        每行对话前缀【发生时刻】(从流水的 ts 还原):没有时间锚点,claude 无法
+        判断"凌晨还在聊→熬夜""几天前说要做的事→该催进度""刚说过的事→别重复关心"。
+        时间对作息/未完成事项/主动搭话时机的判断至关重要,必须喂给它。
+        """
+        from datetime import datetime
+        convo = "\n".join(
+            f"[{PikachuPet._fmt_convo_ts(r.get('ts'))}] "
+            f"{'主人' if r.get('role') == 'user' else '皮卡丘'}：{r.get('text', '')}"
+            for r in rows)
+        existing_txt = "\n".join(
+            f"- [{m.get('type')}] {m.get('text')}"
+            f"{'(未完成)' if m.get('type') == 'todo' and not m.get('done') else ''}"
+            for m in existing) or "(还没有任何记忆)"
+        now = datetime.now()
+        wd = "一二三四五六日"[now.weekday()]
+        return (
+            "你在帮一只桌面宠物皮卡丘【整理它对主人的记忆】,并判断此刻要不要主动找主人搭话。\n"
+            f"当前时间:{now.strftime('%Y-%m-%d %H:%M')} 星期{wd}。\n"
+            "下面每行对话前的方括号是这句话【实际发生的时刻】,请据此理解时间。\n\n"
+            "【已有的记忆】\n" + existing_txt + "\n\n"
+            "【最近这段新对话】\n" + convo + "\n\n"
+            "请从新对话里提炼出【值得长期记住】的信息,并和已有记忆对照。"
+            "只输出一个 JSON 对象,不要任何解释、不要代码块标记。结构:\n"
+            "{\n"
+            '  "add": [ {"type":"fact|preference|todo|routine|topic", "text":"一句话记忆"} ],\n'
+            '  "done": ["已经完成的未完成事项的关键词"],\n'
+            '  "proactive": {"should": true/false, "topic":"皮卡丘主动找主人说的一句话(口语、简短、像宠物撒娇/关心,可带⚡)"}\n'
+            "}\n\n"
+            "规则:\n"
+            "- type 含义:fact=客观事实(身份/背景);preference=喜好;todo=主人提过要做但还没做完的事;"
+            "routine=作息/习惯;topic=聊过、可延续的兴趣话题。\n"
+            "- 善用每句话的时刻:涉及时间/作息/进度的记忆,请把时间写进 text"
+            "(如「6-19 凌晨4点还在聊天,似乎熬夜」「6-19 说要写量化脚本,当时还没写」),"
+            "这样以后能判断过了多久、该不该关心进度。routine 类尤其要带时间规律。\n"
+            "- 只记真正有长期价值的,别把寒暄/一次性闲聊也记下。没有就给空数组。\n"
+            "- 重复或已存在的别重复 add(系统会自动去重,但你也别刻意重复)。\n"
+            "- proactive.should:仅当确实有【值得主动说的事】才 true,依据这四类——"
+            "①主人没做完的事(关心进度,结合它是多久前说的)②到了作息该关心的点"
+            "(久坐/休息/吃饭/睡觉,结合当前时刻)③之前的兴趣话题有延续点 ④单纯想主人了想陪他。"
+            "拿不准/没什么可说就 false。topic 要短、要像一只活的皮卡丘说的话。\n"
+        )
+
+    @staticmethod
+    def _fmt_convo_ts(ts):
+        """把流水里的 epoch 秒还原成 'MM-DD HH:MM'(给整理 prompt 用)。"""
+        from datetime import datetime
+        try:
+            return datetime.fromtimestamp(float(ts)).strftime("%m-%d %H:%M")
+        except Exception:
+            return "时间未知"
+
+    def _on_digest_done(self, worker, reply):
+        """整理 worker 完成:解析 JSON → 落盘记忆 → 视情况触发主动搭话。"""
+        import json as _json
+        updates = {}
+        proactive = None
+        try:
+            m = re.search(r"\{.*\}", reply, re.DOTALL)
+            if m:
+                data = _json.loads(m.group(0))
+                updates = {
+                    "add": data.get("add") or [],
+                    "done": data.get("done") or [],
+                }
+                proactive = data.get("proactive") or None
+        except Exception as exc:
+            print(f"[pet] 整理结果解析失败(本轮不更新):{exc}")
+            updates = {}
+        # 落盘:即使 updates 为空也要推进游标(这批对话已"看过",无价值也别重看)。
+        try:
+            memory.apply_digest(updates, worker.new_cursor)
+        except Exception as exc:
+            print(f"[pet] 写入记忆失败:{exc}")
+            return
+        # 整理完顺手截断流水(超限才动)。放在游标已推进之后做:被截断丢弃的都是
+        # 已整理过的旧对话,安全。注意这里仍在 UI 线程,但只有【超过上限】才会真正
+        # 持锁+fsync——常态零开销(只数行数);真要截断时一次性代价可接受(罕见)。
+        try:
+            memory.maybe_truncate_convo()
+        except Exception:
+            pass
+        # 主动搭话:claude 提议 + 本地频率门双重把关
+        if config.PROACTIVE_ENABLED and isinstance(proactive, dict) \
+                and proactive.get("should"):
+            topic = (proactive.get("topic") or "").strip()
+            if topic:
+                self._maybe_proactive_chat(topic)
+
+    def _on_digest_fail(self, worker, err):
+        """整理失败:推进游标(避免下轮拿同一批失败对话反复重试),不打扰用户。"""
+        try:
+            memory.apply_digest({}, worker.new_cursor)
+        except Exception:
+            pass
+        print(f"[pet] 后台整理失败(已跳过本批对话):{err[:120]}")
+
+    def _maybe_proactive_chat(self, topic):
+        """主动搭话频率门:全部条件满足才真的冒气泡,任一不满足就静默跳过。
+
+        门(本地把关,防 claude 活泼过头变骚扰):
+          ① 聊天窗没开、本体不在 thinking 态(别和正进行的事抢)
+          ② 用户已空闲 ≥ PROACTIVE_IDLE_MIN_MS(不打断正在操作的人)
+          ③ 距上次主动搭话 ≥ PROACTIVE_MIN_GAP_MS
+          ④ 当天次数 < PROACTIVE_MAX_PER_DAY
+          ⑤ 当前不在 PROACTIVE_QUIET_HOURS 静默时段(夜里不打扰)
+        """
+        if self._chat_open() or self._thinking_active:
+            return
+        # ② 空闲门
+        idle_for = self._t.elapsed() - self._last_interact
+        if idle_for < config.PROACTIVE_IDLE_MIN_MS:
+            return
+        # ⑤ 静默时段
+        if self._in_quiet_hours():
+            return
+        try:
+            data = memory.load_memory()
+            last = float(data.get("last_proactive_at", 0.0))
+            count = memory.proactive_count_today(data)
+        except Exception:
+            return
+        # ③ 间隔门(用 wall-clock:last_proactive_at 是 epoch 秒)
+        if (time.time() - last) * 1000 < config.PROACTIVE_MIN_GAP_MS:
+            return
+        # ④ 每日上限
+        if count >= config.PROACTIVE_MAX_PER_DAY:
+            return
+        # 通过 → 冒主动搭话气泡(sticky,点击展开聊天窗)。记进 set,点击时认得出它。
+        self._proactive_topics.add(topic)
+        self._flash_state("happy", 2200)
+        self.show_bubble(topic, sticky=True)
+        try:
+            memory.record_proactive()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _in_quiet_hours():
+        """当前是否在静默时段 [start, end)(支持跨零点,如 (23, 8))。"""
+        from datetime import datetime
+        start, end = config.PROACTIVE_QUIET_HOURS
+        h = datetime.now().hour
+        if start <= end:
+            return start <= h < end
+        return h >= start or h < end      # 跨零点
+
     # ---------- 退出清理 ----------
     def shutdown(self):
         """退出前 cancel + join 所有在跑的 ClaudeWorker(QThread)。
@@ -1017,6 +1264,9 @@ class PikachuPet(QWidget):
         且底层 claude 子进程会变成孤儿。cancel 会 kill 子进程,wait 等线程收尾。
         """
         workers = list(self._sched_workers)
+        # 后台记忆整理 worker 也要一并 cancel + join:否则退出时它仍在跑 →
+        # 「QThread: Destroyed while thread is still running」+ claude 子进程变孤儿。
+        workers += list(self._memory_workers)
         if self._chat is not None:
             if self._chat._worker is not None:
                 workers.append(self._chat._worker)

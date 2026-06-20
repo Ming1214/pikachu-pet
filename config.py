@@ -170,6 +170,13 @@ def _cleanup_garbage_paths():
     own = os.getpid()
     paths += glob.glob(os.path.join(BASE_DIR, f"scheduled_tasks.json.{own}.tmp"))
     paths += glob.glob(os.path.join(BASE_DIR, f"mcp_config.json.{own}.tmp"))
+    # 记忆/对话流水的原子写残留临时文件:同理只清【自己这个进程】留下的
+    # (用本进程 pid 精确匹配),不碰别的实例正在写的 .tmp。注意【不删】
+    # memory.json / memory.md / conversation.jsonl 本身——那是用户数据,退出保留;
+    # 也【不删】它们的 .lock 文件(理由同 scheduled_tasks.json.lock,见上)。
+    paths += glob.glob(os.path.join(BASE_DIR, f"memory.json.{own}.tmp"))
+    paths += glob.glob(os.path.join(BASE_DIR, f"memory.md.{own}.tmp"))
+    paths += glob.glob(os.path.join(BASE_DIR, f"conversation.jsonl.{own}.tmp"))
     return paths
 
 # ── 首次引导(E1)──
@@ -191,6 +198,40 @@ STICKY_QUEUE_MAX = 8
 # 危险操作(git push、删文件…)。默认不让它自动执行,而是到点提醒用户手动确认,
 # 把"周期自动干活"降级为"周期提醒"。设 True 才允许周期任务真的自动执行。
 ALLOW_INTERVAL_ACTION = False
+
+# ─────────────────────────  记忆碎片 / 主动搭话  ─────────────────────────
+# 让皮卡丘慢慢"熟悉"主人:后台轮询定期把最近对话提炼成"记忆"存档,
+# 正常聊天时把记忆注入 prompt(它就记得你),还会在发现值得聊的话题时主动搭话。
+MEMORY_ENABLED = True
+# 三个【用户数据】文件(退出不删、不入库,和 scheduled_tasks.json 同等待遇):
+MEMORY_PATH = os.path.join(BASE_DIR, "memory.json")        # 记忆库(机器主存)
+MEMORY_MD_PATH = os.path.join(BASE_DIR, "memory.md")        # 自动导出,给人看
+CONVO_LOG_PATH = os.path.join(BASE_DIR, "conversation.jsonl")  # 对话流水(整理原料)
+
+# 整理频率:每 30 分钟轮询一次;这段时间内【没有新对话则跳过】(零 claude 开销)。
+DIGEST_INTERVAL_MS = 30 * 60 * 1000
+# 对话流水上限:超出按尾部 N 行截断(防无限增长)。
+CONVO_LOG_MAX_LINES = 500
+# 记忆条数上限:超出按 weight(重要度)淘汰最不重要的。
+MEMORY_MAX_ITEMS = 60
+# 每次整理喂给 claude 的最大新对话行数(防一次性塞太多撑爆 prompt)。
+DIGEST_MAX_CONVO_LINES = 60
+# 注入正常聊天 prompt 的高权重记忆条数(简短,避免 prompt 膨胀)。
+MEMORY_INJECT_TOP_N = 8
+# 记忆老化:每天权重衰减系数(<1 越小衰减越快);低于阈值且超量时被淘汰。
+MEMORY_DECAY_PER_DAY = 0.92
+
+# ── 主动搭话(先"活泼"测效果,这些参数后续可单独调小变克制)──
+PROACTIVE_ENABLED = True
+# 两次主动搭话最小间隔(活泼:25 分钟)。
+PROACTIVE_MIN_GAP_MS = 25 * 60 * 1000
+# 用户至少空闲这么久才搭话(不打断正在操作的人)。
+PROACTIVE_IDLE_MIN_MS = 3 * 60 * 1000
+# 每天主动搭话次数上限(活泼:6;克制版改 2~3)。
+PROACTIVE_MAX_PER_DAY = 6
+# 静默时段 [start, end):这段钟点内不主动打扰(夜里)。23 点到次日 8 点。
+PROACTIVE_QUIET_HOURS = (23, 8)
+
 
 # 皮卡丘人设:像一只真的宠物,不是 AI 助手。
 PIKACHU_PERSONA = (

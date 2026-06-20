@@ -27,6 +27,16 @@ scheduled_tasks.json.*.tmp
 .watchdog_pids
 # 首次引导标记
 .onboarded
+# 记忆碎片(用户数据):记忆库 + 自动导出的 md + 对话流水。退出保留、不入库。
+memory.json
+memory.md
+conversation.jsonl
+# 记忆相关的锁 / 原子写残留临时文件
+memory.json.lock
+memory.json.*.tmp
+memory.md.*.tmp
+conversation.jsonl.lock
+conversation.jsonl.*.tmp
 
 # ── 编辑器 / IDE ────────────────────────────────────────
 .vscode/

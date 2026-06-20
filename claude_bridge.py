@@ -159,6 +159,16 @@ def ask_pikachu(
     """
     full_prompt = _build_prompt(prompt, history)
     persona = config.PIKACHU_PERSONA + "\n\n" + _scheduling_hint()
+    # 注入长期记忆:让皮卡丘"记得"主人(在学什么、喜好、没做完的事…),
+    # 自然体现在对话里。失败/无记忆则不注入,绝不影响聊天。
+    if getattr(config, "MEMORY_ENABLED", False):
+        try:
+            import memory
+            mem_summary = memory.recent_memory_summary()
+            if mem_summary:
+                persona += "\n\n" + mem_summary
+        except Exception:
+            pass
 
     cmd = [
         config.CLAUDE_BIN,
