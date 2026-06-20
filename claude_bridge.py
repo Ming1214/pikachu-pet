@@ -314,6 +314,10 @@ def ask_pikachu(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # 显式钉死 UTF-8:claude 输出含中文/emoji,text=True 默认跟随系统 locale,
+            # LANG=C 等非 UTF-8 环境会 UnicodeDecodeError → 被兜底成"皮卡丘短路了"。
+            encoding="utf-8",
+            errors="replace",
             # 独立会话/进程组:取消或超时时可用 killpg 连同 MCP 孙进程一起杀干净
             start_new_session=True,
         )
@@ -410,6 +414,7 @@ def ask_raw(prompt: str, *, timeout_sec: int = 45,
         proc = subprocess.Popen(
             cmd, cwd=config.CLAUDE_WORKDIR, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",  # 同上:钉死 UTF-8,防非 UTF-8 locale 解码崩
             start_new_session=True,
         )
     except FileNotFoundError as exc:

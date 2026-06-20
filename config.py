@@ -140,15 +140,22 @@ CLAUDE_PERMISSION_MODE = "auto"
 #
 # 第 0 层:危险命令清单(三层共用的"什么算危险")。预编译正则,主程序与 hook 脚本
 # (pika_guardian.py)共享同一份,杜绝两处定义漂移。只放真不可逆的:
+# 几个"命令位"前缀片段,供下面收窄正则共用:命令只可能出现在【整条命令开头】或
+# 【shell 分隔符之后】(; && || | & 开头的 ( 子shell、换行)。用它把"真在跑这个命令"
+# 和"只是把这个词写在字符串/文件名/参数里"区分开,避免误伤(详见各条注释)。
+_CMD_POS = r"(?:^|[;&|\n(]|&&|\|\|)\s*"
 DANGER_PATTERNS = [
-    re.compile(r"\brm\s+-[a-z]*[rf]", re.I),          # rm -rf / rm -fr / rm -r / rm -f
+    re.compile(r"\brm\s+-[a-z]*[rf]", re.I),          # rm -rf / rm -fr / rm -r / rm -f(含单文件删,按要求一律拦)
     re.compile(r"git\s+push\b.*(--force|--force-with-lease|\s-f\b)", re.I),  # 强推
     re.compile(r"git\s+reset\s+--hard", re.I),        # 硬重置(丢工作区改动)
     re.compile(r"\bmkfs\b", re.I),                    # 格式化文件系统
-    re.compile(r"\bdd\s+if=", re.I),                  # 裸写盘
+    # dd:只有读/写裸设备(if=/dev/… 或 of=/dev/…)才不可逆;文件对拷 dd if=a of=b 安全,不拦。
+    re.compile(r"\bdd\b[^\n]*\b(?:if|of)=/dev/", re.I),
     re.compile(r">\s*/dev/(sd|disk|nvme)", re.I),     # 重定向写裸设备
-    re.compile(r"\bsudo\b", re.I),                    # 提权一律拦
-    re.compile(r"\b(shutdown|reboot|halt|poweroff)\b", re.I),  # 关机/重启
+    # sudo / 关机系列:只在【命令位】出现才算真要执行;写在 echo 字符串里、commit message
+    # 里、文件名里(halt.py)的同名词不拦,免得日常聊天/文档生成被误伤。
+    re.compile(_CMD_POS + r"sudo\b", re.I),           # 提权
+    re.compile(_CMD_POS + r"(shutdown|reboot|halt|poweroff)\b", re.I),  # 关机/重启
 ]
 
 # 危险操作确认:跨进程文件信令(hook 子进程 ↔ 桌宠主进程)

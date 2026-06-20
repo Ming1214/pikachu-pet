@@ -1326,10 +1326,8 @@ class PikachuPet(QWidget):
             # 同时往聊天窗补一条皮卡丘口吻的提醒记录:用户常在聊天窗里建提醒,
             # 到点却只在本体冒气泡、聊天窗空白(体验断层)。本地拼模板、不调 claude,
             # 走互锁:聊天窗开着且空闲就直接写,否则暂存等空了/重开窗补写。
-            from datetime import datetime as _dt
-            line = (f"*蹦到你面前* {desc[:24]} 时间到啦!皮卡有叫你哦~ ⚡"
-                    f"({_dt.now().strftime('%H:%M')})")
-            self._deliver_to_chat(line)
+            bubble = f"*蹦到你面前* {desc[:24]} 时间到啦!皮卡有叫你哦~ ⚡"
+            self._deliver_to_chat(bubble)
             return
 
         # 执行类:调 claude 真去干活
@@ -1404,20 +1402,35 @@ class PikachuPet(QWidget):
         self.show_bubble(f"⚠️ 没做成「{desc[:10]}」(双击我看详情)", sticky=True)
         self._deliver_to_chat(f"*耷拉耳朵* 「{desc}」没做成…{err[:80]}")
 
-    def _deliver_to_chat(self, text):
+    @staticmethod
+    def _sched_history_text(bubble_text):
+        """给进聊天窗多轮历史的定时任务文本加【绝对日期+时间】锚点。
+
+        气泡上只显示相对/简短措辞,但进 self._history 给 claude 的那份必须带
+        完整年月日+时分:否则用户隔天接着聊"刚那条提醒"时,claude 不知道它是
+        哪天几点跑的,多轮上下文会错位。格式 [YYYY-MM-DD HH:MM] 与 claude_bridge
+        注入的【当前时间】同款,claude 读得顺。"""
+        from datetime import datetime as _dt
+        return f"[{_dt.now().strftime('%Y-%m-%d %H:%M')}] {bubble_text}"
+
+    def _deliver_to_chat(self, bubble_text):
         """把一条定时任务消息(提醒/完成/失败)送进聊天窗,带互锁:聊天窗开着且
         空闲就直接写,否则暂存(等聊天空了 / open_chat / _exit_thinking 时补写)。
 
-        统一三处调用(reminder 到点、_on_sched_done、_on_sched_fail)的写入语义,
-        避免各写一份导致互锁逻辑漂移。"""
+        统一四处写入(reminder 到点、_on_sched_done、_on_sched_fail、flush 补写)的
+        语义:既显示气泡,又进多轮历史 + 落记忆流水(走 record_scheduled),且历史
+        那份带日期时间锚点 —— 此前只 _add 不进历史,定时结果对后续对话不可见。"""
+        hist = self._sched_history_text(bubble_text)
         if self._chat_can_write_now():
-            self._chat._add("皮卡", text)
+            self._chat.record_scheduled(bubble_text, hist)
         else:
-            self._stash_result(text)
+            self._stash_result(bubble_text, hist)
 
-    def _stash_result(self, text):
-        """暂存一条定时任务结果,等聊天窗打开时补写。上限 10 条,超出丢最旧。"""
-        self._pending_results.append(text)
+    def _stash_result(self, bubble_text, history_text):
+        """暂存一条定时任务结果(气泡文本 + 已带日期锚点的历史文本),等聊天窗
+        打开时补写。上限 10 条,超出丢最旧。历史文本在暂存时就定好日期(=事件
+        真正发生的时刻),而非补写时,避免隔天打开窗把日期写成"打开那天"。"""
+        self._pending_results.append((bubble_text, history_text))
         if len(self._pending_results) > 10:
             del self._pending_results[0]
 
@@ -1561,8 +1574,8 @@ class PikachuPet(QWidget):
         if not self._chat_can_write_now():
             return
         pending, self._pending_results = self._pending_results, []
-        for text in pending:
-            self._chat._add("皮卡", text)
+        for bubble_text, history_text in pending:
+            self._chat.record_scheduled(bubble_text, history_text)
 
     def _on_local_schedule(self, desc):
         """聊天窗快通道本地建任务后回调:本体放电 + 冒确认气泡。"""

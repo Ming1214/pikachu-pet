@@ -742,6 +742,25 @@ class ChatWindow(QWidget):
         self._log_convo("pika", text)
         QTimer.singleShot(30, self._scroll_bottom)
 
+    def record_scheduled(self, bubble_text, history_text=None):
+        """把一条定时任务/提醒的结果写进聊天窗:显示气泡 + 进多轮历史 + 落记忆流水。
+
+        和 inject_pika_opening 同款"渲染 + 记历史 + 落流水"三件套,区别是允许
+        bubble_text(给用户看的措辞)与 history_text(进 self._history 给 claude
+        的措辞)不同:history_text 里带【绝对日期+时间】锚点,这样后续多轮对话时
+        claude 能知道"这条定时任务是哪天几点跑的",上下文才连贯;不传则与气泡同文。
+
+        历史角色用 '皮卡丘',与 _build_prompt 里其它皮卡丘发言一致。失败不影响 UI。
+        """
+        bubble_text = (bubble_text or "").strip()
+        if not bubble_text:
+            return
+        self._add("皮卡", bubble_text)
+        hist = (history_text or bubble_text).strip()
+        self._history.append(("皮卡丘", hist))
+        self._log_convo("pika", hist)
+        QTimer.singleShot(30, self._scroll_bottom)
+
     @staticmethod
     def _log_convo(role, text):
         """把一句对话落盘到记忆流水(整理记忆的原料)。失败绝不影响聊天。"""
