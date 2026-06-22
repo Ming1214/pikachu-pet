@@ -16,7 +16,29 @@ FOLLOW_ENABLED / BREATH_ENABLED / FLOAT_ENABLED / SPARK_ENABLED 等)不放进来
   help         : 可选,一句话说明
 """
 
+# 可选宝可梦清单(供 ACTIVE_POKEMON 下拉)。从 pokedex/ 目录实际有哪些数据包动态取,
+# 不手维护名单。import 失败兜底只给 pikachu(永远存在的默认包)。
+try:
+    import pokedex
+    _POKEMON_CHOICES = pokedex.available_packs() or ["pikachu"]
+    # 下拉【显示中文名、值用英文模块名】:choice_labels 是 {模块名: 中文名}。
+    _POKEMON_LABELS = pokedex.pack_labels() or {"pikachu": "皮卡丘"}
+except Exception:
+    _POKEMON_CHOICES = ["pikachu"]
+    _POKEMON_LABELS = {"pikachu": "皮卡丘"}
+
 EDITABLE = [
+    # ─────────── 宝可梦 ───────────
+    {"key": "ACTIVE_POKEMON", "label": "当前宝可梦", "group": "宝可梦",
+     "type": "enum", "choices": _POKEMON_CHOICES, "choice_labels": _POKEMON_LABELS,
+     "needs_restart": True, "restart_label": "形象重启生效",
+     "help": "换一只宝可梦(人设/台词/配色立刻热生效;形象动画在重启后生效)。"
+             "每只有各自独立的记忆。"},
+    {"key": "MEMORY_SHARED_ACROSS_POKEMON", "label": "宝可梦共享记忆", "group": "宝可梦",
+     "type": "bool", "needs_restart": False,
+     "help": "开:所有宝可梦都能读到你和任何一只说过的事(更连贯)。"
+             "关:每只只记得自己和你的事(各自独立人格)。定时提醒/任务始终共享,不受此开关影响。"},
+
     # ─────────── 模型与权限 ───────────
     {"key": "CLAUDE_MODEL", "label": "模型", "group": "模型与权限",
      "type": "enum",

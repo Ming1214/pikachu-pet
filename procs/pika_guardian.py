@@ -56,8 +56,14 @@ sys.path.insert(0, _ROOT)
 try:
     import config  # noqa: E402
 except Exception:
-    _emit("deny", "皮卡丘配置没加载好,保险起见这次先没做~")
+    _emit("deny", "配置没加载好,保险起见这次先没做~")
     sys.exit(0)
+
+# 当前宝可梦名(危险确认气泡用它的口吻,换宝可梦时一致)。读不到则用通用词。
+try:
+    _PET = config.PET_NAME
+except Exception:
+    _PET = "桌宠"
 
 
 def _log(record: dict) -> None:
@@ -145,7 +151,7 @@ def main() -> None:
     if not _write_pending(req_id, command):
         # 写 pending 失败 → 桌宠看不到,无法确认 → 保守 deny。
         _log({"req_id": req_id, "command": command, "decision": "deny-no-pending"})
-        _emit("deny", "皮卡丘没能把确认请求递出去,这次先没做这个危险操作哦~")
+        _emit("deny", f"{_PET}没能把确认请求递出去,这次先没做这个危险操作哦~")
         return
 
     try:
@@ -159,7 +165,7 @@ def main() -> None:
     if decision == "allow":
         _emit("allow")
     else:
-        _emit("deny", "主人这次没同意这个操作~ *耳朵耷拉* 皮卡丘就先不做啦。")
+        _emit("deny", f"主人这次没同意这个操作~ *耳朵耷拉* {_PET}就先不做啦。")
 
 
 if __name__ == "__main__":
@@ -168,5 +174,5 @@ if __name__ == "__main__":
     except Exception:
         # 兜底:hook 脚本本身崩了也不该让 claude 误执行危险命令 → deny。
         # 但若崩在 _emit 之前,claude 会按退出码处理;我们再补一次 deny 输出。
-        _emit("deny", "皮卡丘守门时短路了,保险起见先没做~")
+        _emit("deny", f"{_PET}守门时短路了,保险起见先没做~")
         sys.exit(0)

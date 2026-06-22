@@ -13,46 +13,47 @@ venv/
 env/
 ENV/
 
-# ── 运行时自动生成的文件(不该进版本库)────────────────
-# 用户的定时任务数据,运行时增删
+# ── 运行时 / 用户数据(全部收纳在 data/,整目录不入库)──────────────
+# memory*.json/.md(每只宝可梦各一份)、conversation*.jsonl、scheduled_tasks.json、
+# config_overrides.json、call_log.jsonl、danger_ops.jsonl、tool_events.jsonl、
+# guardian_*、pet_settings.json、mcp_config.json、.web_console_token、.onboarded、
+# .watchdog_pids、.chat_uploads_*/、各类 .lock / .*.tmp 残留——都落在 data/ 下。
+# 整目录忽略,新增宝可梦的 memory_<名>.json 自动覆盖,无需逐个补规则。
+data/
+
+# ── 兼容老布局(数据曾散在项目根;config.py 启动会自动迁移到 data/,这里兜底)──
 scheduled_tasks.json
-# MCP 工具事件流,运行时持续追加
+scheduled_tasks.json.lock
+scheduled_tasks.json.*.tmp
 tool_events.jsonl
-# claude_bridge._ensure_mcp_config() 自动生成
 mcp_config.json
-# 危险操作确认:hook settings 自动生成 + pending 流水 + 决策信令(均为运行时态)
+mcp_config.json.*.tmp
 pet_settings.json
 pet_settings.json.*.tmp
 guardian_pending.jsonl
 guardian_decision.*
-# 危险操作流水(用户数据):每次危险命令的 pending/allow/deny 留痕。退出保留、不入库。
 danger_ops.jsonl
-# 轻量调用日志(用户数据):每次调 claude 的元数据(不含正文)。退出保留、不入库。
 call_log.jsonl
 call_log.jsonl.*.tmp
-# 锁文件 / 原子写残留临时文件
-scheduled_tasks.json.lock
-scheduled_tasks.json.*.tmp
-# 看门狗:本会话 claude 子进程 pid 登记(退出清理用)
 .watchdog_pids
-# 聊天窗发图/文件:用户附件副本目录(按 pid 隔离,运行时垃圾,退出 rmtree 清掉、不入库)
 .chat_uploads_*/
-# 首次引导标记
 .onboarded
-# Web 控制台:配置覆盖(用户数据,退出保留、不入库)+ 访问令牌(运行时信令,退出清)
 config_overrides.json
 config_overrides.json.*.tmp
 .web_console_token
-# 记忆碎片(用户数据):记忆库 + 自动导出的 md + 对话流水。退出保留、不入库。
+# 记忆碎片(皮卡丘固定名 + 其余宝可梦 memory_<名>.* 通配)
 memory.json
 memory.md
-conversation.jsonl
-# 记忆相关的锁 / 原子写残留临时文件
 memory.json.lock
-memory.json.*.tmp
-memory.md.*.tmp
-conversation.jsonl.lock
-conversation.jsonl.*.tmp
+memory_*.json
+memory_*.md
+memory_*.json.lock
+memory*.json.*.tmp
+memory*.md.*.tmp
+conversation.jsonl
+conversation_*.jsonl
+conversation*.jsonl.lock
+conversation*.jsonl.*.tmp
 
 # ── 编辑器 / IDE ────────────────────────────────────────
 .vscode/

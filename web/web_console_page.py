@@ -11,7 +11,7 @@ token 由页面从自身 url 的 ?token= 读出,后续所有 fetch 自动带上(
 """
 
 DENIED_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
-<title>皮卡丘控制台</title><style>
+<title>宝可梦桌宠控制台</title><style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,"PingFang SC",sans-serif;
   background:linear-gradient(180deg,#ee1515 0 46%,#fff 46% 100%);
@@ -32,7 +32,7 @@ PAGE_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⚡ 皮卡丘控制台</title>
+<title>⚡ 宝可梦桌宠控制台</title>
 <style>
   :root{
     /* 精灵球主题 */
@@ -284,8 +284,8 @@ PAGE_HTML = r"""<!doctype html>
   <div class="logo">
     <span class="ball"></span>
     <div>
-      <h1>皮卡丘控制台</h1>
-      <div class="sub">Pikachu Pet · local console</div>
+      <h1>宝可梦桌宠控制台</h1>
+      <div class="sub">Pokémon Pet · local console</div>
     </div>
   </div>
   <div class="conn" id="conn"><span class="led"></span><span id="conn-txt">连接中…</span>
@@ -344,10 +344,10 @@ PAGE_HTML = r"""<!doctype html>
 
   <!-- ── 记忆 ── -->
   <section class="tab" id="tab-memory">
-    <div class="card"><h2><span class="bar"></span>教皮卡丘记住一件事</h2>
+    <div class="card"><h2><span class="bar"></span>教它记住一件事</h2>
       <div class="row" style="border:none;padding:4px 0">
         <select id="m-type" class="ctrl"></select>
-        <input type="text" id="m-text" placeholder="皮卡丘要记住的事…" style="flex:1"
+        <input type="text" id="m-text" placeholder="要它记住的事…" style="flex:1"
           onkeydown="if(event.key==='Enter')addMem()">
         <button class="btn primary ctrl" onclick="addMem()">＋ 记下</button>
       </div>
@@ -381,6 +381,7 @@ function api(path, opts={}){
   });
 }
 let _toastTimer;
+let PET_NAME="";   // 当前宝可梦显示名(由 /api/status 刷新;对话流水显示发言者用)
 function toast(msg,kind){ const t=Q("#toast"); t.textContent=msg;
   t.className="toast show"+(kind?(" "+kind):"");
   clearTimeout(_toastTimer);
@@ -425,6 +426,7 @@ async function poll(){
   try{
     const s = await api("/api/status");
     conn.className="conn ok"; Q("#conn-txt").textContent="已连接";
+    if(s.pet_name) PET_NAME=s.pet_name;
     const r = s.runtime||{};
     const st = r.state||"idle";
 
@@ -503,7 +505,10 @@ async function loadConfig(){
   }catch(e){ Q("#cfg").innerHTML='<div class="empty"><span class="e">⚠️</span>加载失败:'+esc(e.message)+'</div>'; }
 }
 function pins(it){
-  return (it.needs_restart?`<span class="pin restart">需重启</span>`:"")+
+  // 默认徽章文字「需重启」;某些项(如切宝可梦:人设/配色热生效、仅形象需重启)可用
+  // schema 里的 restart_label 自定义,避免「需重启」误导用户以为整项都要重启才生效。
+  const rl = it.restart_label || "需重启";
+  return (it.needs_restart?`<span class="pin restart">${esc(rl)}</span>`:"")+
          (it.overridden?`<span class="pin ov">已改</span>`:"");
 }
 function renderItem(it){
@@ -514,7 +519,10 @@ function renderItem(it){
   if(it.type==="bool"){
     ctrl=`<label class="switch"><input type="checkbox" id="${id}" ${it.value?"checked":""}><span class="slider"></span></label>`;
   }else if(it.type==="enum"){
-    ctrl=`<select id="${id}">`+it.choices.map(c=>`<option value="${esc(c)}" ${c===it.value?"selected":""}>${esc(c||"(默认)")}</option>`).join("")+`</select>`;
+    // option 的 value 用真实值(英文模块名等),显示文字优先用 choice_labels 里的中文名;
+    // 没有映射则回退到值本身(空值显示"(默认)")。
+    const labels = it.choice_labels || {};
+    ctrl=`<select id="${id}">`+it.choices.map(c=>`<option value="${esc(c)}" ${c===it.value?"selected":""}>${esc(labels[c] || c || "(默认)")}</option>`).join("")+`</select>`;
   }else if(it.type==="int"||it.type==="float"){
     ctrl=`<input type="number" id="${id}" value="${esc(it.value)}" ${it.min!=null?`min="${it.min}"`:""} ${it.max!=null?`max="${it.max}"`:""} ${it.type==="float"?'step="0.01"':""}>`;
   }else if(it.type==="hours_range"){
@@ -551,7 +559,12 @@ async function saveConfig(){
   try{
     const r = await api("/api/config",{method:"POST",body:JSON.stringify(payload)});
     let msg="已保存 ✓";
-    if(r.needs_restart && r.needs_restart.length) msg+=`(${r.needs_restart.length} 项重启后生效)`;
+    const rk = r.needs_restart || [];
+    if(rk.length){
+      // 切宝可梦特殊措辞:人设/台词/配色已热生效,只有形象动画要重启——别笼统说"N 项重启"。
+      if(rk.length===1 && rk[0]==="ACTIVE_POKEMON") msg+="(人设已生效,形象重启后更新)";
+      else msg+=`(${rk.length} 项重启后生效)`;
+    }
     toast(msg,"ok"); loadConfig();
   }catch(e){ toast("保存失败:"+e.message,"err"); }
 }
@@ -565,7 +578,7 @@ async function resetKey(key){
 async function loadTasks(){
   try{
     const d = await api("/api/tasks"); const ts=d.tasks||[];
-    if(!ts.length){ Q("#tasks").innerHTML='<div class="empty"><span class="e">⏰</span>暂无定时任务<br><span class="muted">跟皮卡丘说「3 分钟后提醒我喝水」就会出现在这</span></div>'; return; }
+    if(!ts.length){ Q("#tasks").innerHTML='<div class="empty"><span class="e">⏰</span>暂无定时任务<br><span class="muted">跟它说「3 分钟后提醒我喝水」就会出现在这</span></div>'; return; }
     Q("#tasks").innerHTML = `<table><thead><tr><th>描述</th><th>类型</th><th>状态</th><th></th></tr></thead><tbody>`+
       ts.map(t=>`<tr><td>${esc(t.desc||t.prompt||"")}</td>
         <td><span class="tag">${esc(t.mode||"")} · ${esc(t.kind||"")}</span></td>
@@ -588,7 +601,7 @@ async function loadMem(){
     Q("#m-type").innerHTML = MEM_TYPES.map(t=>`<option value="${esc(t)}">${esc(TYPE_CN[t]||t)}</option>`).join("");
     const ms=d.memories||[];
     Q("#mem-count").textContent = ms.length ? `共 ${ms.length} 条` : "";
-    if(!ms.length){ Q("#mem").innerHTML='<div class="empty"><span class="e">🧠</span>还没有记忆<br><span class="muted">聊久了皮卡丘会自己记;也可以在上面手动教它</span></div>'; return; }
+    if(!ms.length){ Q("#mem").innerHTML='<div class="empty"><span class="e">🧠</span>还没有记忆<br><span class="muted">聊久了它会自己记;也可以在上面手动教它</span></div>'; return; }
     Q("#mem").innerHTML = `<table><thead><tr><th style="width:64px">类型</th><th>内容</th><th style="width:60px">权重</th><th style="width:120px"></th></tr></thead><tbody>`+
       ms.map(m=>`<tr>
         <td><span class="tag y">${esc(TYPE_CN[m.type]||m.type)}</span></td>
@@ -650,7 +663,7 @@ function renderConvo(l){
   const txt = String(l.text||"").replace(/\s+/g," ").trim();
   return `<div class="li convo ${isU?'user':'pika'}">
     <div class="ic">${isU?'🧑':'⚡'}</div>
-    <div class="main"><span class="who">${isU?'你':'皮卡'}</span>${esc(txt)}</div>
+    <div class="main"><span class="who">${isU?'你':esc(PET_NAME||'桌宠')}</span>${esc(txt)}</div>
     <div class="ts">${esc(fmtTs(l.ts))}</div>
   </div>`;
 }

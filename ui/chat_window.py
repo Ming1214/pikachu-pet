@@ -75,7 +75,7 @@ class ClaudeWorker(QThread):
                 self.failed.emit(str(exc))
         except Exception as exc:
             if not self._cancel.is_set():
-                self.failed.emit(f"皮卡丘短路了:{exc}")
+                self.failed.emit(f"{config.PET_NAME}短路了:{exc}")
         finally:
             stop.set()
 
@@ -133,13 +133,14 @@ class _TitleBar(QWidget):
         lay.addWidget(self.avatar)
 
         box = QVBoxLayout(); box.setSpacing(0)
-        title = QLabel("皮卡丘")
-        title.setStyleSheet(
+        # 存引用:切宝可梦后由 refresh_identity() 重读 config 刷新文字(否则一直是建窗时的旧名)。
+        self.title = QLabel(config.PET_NAME)
+        self.title.setStyleSheet(
             f"font-size:17px; font-weight:900; color:#FFFFFF; background:transparent; font-family:{FONT};")
-        sub = QLabel("电气鼠宝可梦")
-        sub.setStyleSheet(
+        self.sub = QLabel(config.PET_SPECIES)
+        self.sub.setStyleSheet(
             f"font-size:11px; color:rgba(255,255,255,210); background:transparent; font-family:{FONT};")
-        box.addWidget(title); box.addWidget(sub)
+        box.addWidget(self.title); box.addWidget(self.sub)
         lay.addLayout(box, 1)
 
         close = QPushButton("✕")
@@ -151,6 +152,14 @@ class _TitleBar(QWidget):
             "QPushButton:hover{background:#FFE0E0;}")
         close.clicked.connect(self._win.hide)
         lay.addWidget(close)
+
+    def refresh_identity(self):
+        """切宝可梦后刷新标题/副标题为当前 PET_NAME/PET_SPECIES(热生效)。"""
+        try:
+            self.title.setText(config.PET_NAME)
+            self.sub.setText(config.PET_SPECIES)
+        except Exception:
+            pass
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -340,6 +349,15 @@ class ChatWindow(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # 切宝可梦后标题/副标题/输入框占位符是建窗时固化的旧名,每次显示前按当前
+        # PET_NAME 刷新一次(开销极小),保证换了宝可梦再打开聊天窗身份就对得上。
+        try:
+            if hasattr(self, "_titlebar"):
+                self._titlebar.refresh_identity()
+            self.input.setPlaceholderText(
+                f"和{config.PET_NAME}说点什么…(Enter 发送 / Option+Enter 换行)")
+        except Exception:
+            pass
         macos_window.join_all_spaces(self)
         # 聊天窗 level 显式设为 3(= WindowStaysOnTopHint 在 Cocoa 下本就映射到的
         # NSFloatingWindowLevel):严格说是冗余,但写明白意图——聊天窗浮在普通应用
@@ -381,7 +399,8 @@ class ChatWindow(QWidget):
 
         col = QVBoxLayout(card)
         col.setContentsMargins(0, 0, 0, 0); col.setSpacing(0)
-        col.addWidget(_TitleBar(self))
+        self._titlebar = _TitleBar(self)   # 存引用:showEvent 时刷新身份(切宝可梦热生效)
+        col.addWidget(self._titlebar)
 
         # 消息滚动区(浅灰白底)
         self.scroll = QScrollArea()
@@ -438,7 +457,8 @@ class ChatWindow(QWidget):
         row.addWidget(self.attach)
 
         self.input = _ChatInput()
-        self.input.setPlaceholderText("和皮卡丘说点什么…(Enter 发送 / Option+Enter 换行)")
+        self.input.setPlaceholderText(
+            f"和{config.PET_NAME}说点什么…(Enter 发送 / Option+Enter 换行)")
         self.input.submit.connect(self._send)
         self.input.image_received.connect(self._attach_image)
         self.input.path_received.connect(self._attach_path)
@@ -561,7 +581,7 @@ class ChatWindow(QWidget):
         按扩展名分流:图片走「[图片 #n]」+ 缩略图,其余走「[文件 #n]」+ 文件卡片。
         """
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "选择图片或文件发给皮卡丘", os.path.expanduser("~"),
+            self, f"选择图片或文件发给{config.PET_NAME}", os.path.expanduser("~"),
             "所有文件 (*)")
         for p in paths:
             self._attach_path(p)
@@ -608,7 +628,7 @@ class ChatWindow(QWidget):
         """收一张图(src 为文件路径 str,或剪贴板 QImage 位图)。落盘 + 挂账 + 插占位。"""
         # 来源是磁盘文件时先查大小(QImage 是内存位图,不查)
         if isinstance(src, str) and self._too_big(src):
-            self._attach_fail("这张图太大啦(超过 20MB),皮卡丘看不动~换张小点的?")
+            self._attach_fail(f"这张图太大啦(超过 20MB),{config.PET_NAME}看不动~换张小点的?")
             return
         n = None
         try:
@@ -639,8 +659,8 @@ class ChatWindow(QWidget):
     def _attach_file(self, src):
         """收一个任意文件(src 为文件路径 str)。落盘 + 挂账 + 插「[文件 #n]」占位。"""
         if self._too_big(src):
-            self._attach_fail("这个文件太大啦(超过 20MB),皮卡丘读不动~"
-                              "要不直接把路径发给皮卡丘让它自己去看?")
+            self._attach_fail(f"这个文件太大啦(超过 20MB),{config.PET_NAME}读不动~"
+                              f"要不直接把路径发给{config.PET_NAME}让它自己去看?")
             return
         n = None
         try:
@@ -668,8 +688,8 @@ class ChatWindow(QWidget):
     def _attach_err_msg(exc, what):
         """按异常类型给具体提示:磁盘满单独点明,其余给通用文案。"""
         if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
-            return "磁盘空间不足啦,皮卡丘存不下这个附件了…清点空间再试?"
-        return f"*歪头* {what}皮卡丘没接住诶…换一个试试?"
+            return f"磁盘空间不足啦,{config.PET_NAME}存不下这个附件了…清点空间再试?"
+        return f"*歪头* {what}{config.PET_NAME}没接住诶…换一个试试?"
 
     def _attach_path(self, path):
         """按扩展名把一个本地文件路径分流到 _attach_image / _attach_file。"""
@@ -859,8 +879,10 @@ class ChatWindow(QWidget):
         (替换时由 _reply 解除定宽,恢复成自适应气泡)。
         转圈用独立的快速定时器驱动(每帧 120ms,流畅);读秒走每秒的 tick 信号。
         """
-        b = self._bubble("皮卡", "皮卡丘正在想… ⚡")
-        # 关键:定死宽,内容怎么变都不重排。宽度取够放最长文案("⠋ 皮卡丘正在想… 120 秒 ⚡"),
+        # 发言者 ID 固定用 "皮卡"(内部角色标识,写入记忆流水,不随宝可梦变);
+        # 气泡显示文字用数据包的"思考中"文案。
+        b = self._bubble("皮卡", f"{config.PET_THINKING_TEXT} ⚡")
+        # 关键:定死宽,内容怎么变都不重排。宽度取够放最长文案("⠋ 思考文案 120 秒 ⚡"),
         # 否则 WordWrap=False 会把右边的"秒 ⚡"截掉。
         b.setWordWrap(False)
         b.setFixedWidth(235)
@@ -916,7 +938,7 @@ class ChatWindow(QWidget):
         else:
             tier, tip = 0, ""
         label.setText(
-            f"<div style='line-height:150%;'>{spin} 皮卡丘正在想… {sec_str} 秒 ⚡"
+            f"<div style='line-height:150%;'>{spin} {config.PET_THINKING_TEXT} {sec_str} 秒 ⚡"
             f"{('<br>' + tip) if tip else ''}</div>")
         # 仅在【换档】时调整气泡高度(全程最多 2 次),平时不动 → 不闪。气泡宽度
         # 固定 235,安抚文案够短能放下;多出的第二行需要把固定高度放开重算,
@@ -996,7 +1018,7 @@ class ChatWindow(QWidget):
             # 带附件时额外点明"现在看不了":否则用户看到缩略图却得到拟声词,
             # 会误以为皮卡丘看了图(其实没装 claude,根本没读)。
             if has_attach:
-                pika += "\n\n(*盯着你发的东西* 皮卡丘现在还看不了图片/文件呢,"
+                pika += f"\n\n(*盯着你发的东西* {config.PET_NAME}现在还看不了图片/文件呢,"
                 pika += "得先装好 Claude Code 才行哦~)"
             # 用户气泡已渲染,_say_local 只加皮卡丘气泡 + 把这一轮(plain)进历史/流水
             self._say_local(plain, pika)
@@ -1071,7 +1093,7 @@ class ChatWindow(QWidget):
                 self._say_local(text, "*翻翻小本本* 现在还没有定时任务哦~ 你可以说「每天9点提醒我喝水」⚡")
             else:
                 lines = "\n".join(f"· {scheduler.describe(t)}（id:{t['id'][-4:]}）" for t in tasks)
-                self._say_local(text, f"*掏出小本本* 皮卡丘帮你记着这些啦:\n{lines}\n\n（想删的话说「删除任务 xxxx」)")
+                self._say_local(text, f"*掏出小本本* {config.PET_NAME}帮你记着这些啦:\n{lines}\n\n（想删的话说「删除任务 xxxx」)")
             return True
 
         # 删除任务
@@ -1122,7 +1144,7 @@ class ChatWindow(QWidget):
             # 不静默转给 claude(体验不一致:正常句秒建任务,这句却没反应),
             # 本地给一句友好澄清,告诉用户时间不合法。
             self._say_local(
-                text, "*挠头* 这个时间皮卡丘没看懂诶… 钟点要在 0~23 之间哦,"
+                text, f"*挠头* 这个时间{config.PET_NAME}没看懂诶… 钟点要在 0~23 之间哦,"
                 "换个说法?比如「每天9点提醒我喝水」⚡")
             return True
         return False
@@ -1132,7 +1154,7 @@ class ChatWindow(QWidget):
         created = scheduler.add_task(task)
         if created == "duplicate":
             # 已有等价任务:别重复建,免得到点重复提醒。
-            self._say_local(text, f"*翻了翻小本本* 这个皮卡丘早就记着啦~「{scheduler.describe(task)}」😆")
+            self._say_local(text, f"*翻了翻小本本* 这个{config.PET_NAME}早就记着啦~「{scheduler.describe(task)}」😆")
             return
         if created == "save_failed":
             # 存盘失败:别假报"记下啦",否则用户以为记住了、重启后任务消失。
@@ -1141,7 +1163,7 @@ class ChatWindow(QWidget):
         # 记进历史时带上 id 末4位,让后续"删掉它/改一下"发给 claude 时
         # 它能从历史里看到刚建了哪条任务、对应哪个 id,正确指代。
         pika = (f"*认真记到小本本上* 好嘞!记下啦:\n「{scheduler.describe(task)}」"
-                f"（id:{task['id'][-4:]}）\n到点皮卡丘会帮你搞定的!⚡")
+                f"（id:{task['id'][-4:]}）\n到点{config.PET_NAME}会帮你搞定的!⚡")
         self._say_local(text, pika)
         # 让桌宠本体也冒"已记下"气泡 + 放电,和走 claude+MCP 建任务的路径体验一致
         # (那条路径靠 tool_events.jsonl 通知本体;快通道是本地直存,这里直接回调)。
@@ -1182,8 +1204,8 @@ class ChatWindow(QWidget):
         d = d.lstrip("，,。.、 ")
         # 兜底:清掉可能残留在开头的孤立"半"(如"点半"被拆后剩的"半")
         d = re.sub(r"^半(?![小时点])", "", d).strip()
-        # 去掉开头的称呼"皮卡丘,"
-        d = re.sub(r"^皮卡丘[,，、\s]*", "", d).strip()
+        # 去掉开头的称呼(当前宝可梦名,如"皮卡丘,""小火龙、"):用户常这样喊它建提醒
+        d = re.sub(rf"^{re.escape(config.PET_NAME)}[,，、\s]*", "", d).strip()
         return d
 
     def inject_pika_opening(self, text):
@@ -1196,7 +1218,7 @@ class ChatWindow(QWidget):
         if not text:
             return
         self._add("皮卡", text)
-        self._history.append(("皮卡丘", text))
+        self._history.append((config.PET_NAME,text))
         self._log_convo("pika", text)
         QTimer.singleShot(30, self._scroll_bottom)
 
@@ -1215,7 +1237,7 @@ class ChatWindow(QWidget):
             return
         self._add("皮卡", bubble_text)
         hist = (history_text or bubble_text).strip()
-        self._history.append(("皮卡丘", hist))
+        self._history.append((config.PET_NAME,hist))
         self._log_convo("pika", hist)
         QTimer.singleShot(30, self._scroll_bottom)
 
@@ -1237,7 +1259,7 @@ class ChatWindow(QWidget):
         """
         self._add("皮卡", pika_text)
         self._history.append(("我", user_text))
-        self._history.append(("皮卡丘", pika_text))
+        self._history.append((config.PET_NAME,pika_text))
         # 落盘到记忆流水:本地处理的轮次也是真实对话,要进整理原料
         self._log_convo("user", user_text)
         self._log_convo("pika", pika_text)
@@ -1301,7 +1323,7 @@ class ChatWindow(QWidget):
         else:
             self._add("皮卡", text)
         self._history.append(("我", self._pending_user))
-        self._history.append(("皮卡丘", text))
+        self._history.append((config.PET_NAME,text))
         # 落盘到记忆流水(整理记忆的原料)
         self._log_convo("user", self._pending_user)
         self._log_convo("pika", text)
@@ -1324,7 +1346,7 @@ class ChatWindow(QWidget):
         # 记下皮卡丘没答上来,保持多轮上下文连贯。
         if self._pending_user:
             self._history.append(("我", self._pending_user))
-            self._history.append(("皮卡丘", "(没能回应,出错了)"))
+            self._history.append((config.PET_NAME,"(没能回应,出错了)"))
             # 只落用户这句:皮卡丘没答上来,记下用户说了啥即可(整理时它能看到)
             self._log_convo("user", self._pending_user)
         self._busy(False)
@@ -1347,7 +1369,7 @@ class ChatWindow(QWidget):
             self._worker.cancel()
         if self._thinking is not None:
             self._release_thinking()
-            self._set_html(self._thinking, "（皮卡… 不想了~）"); self._thinking = None
+            self._set_html(self._thinking, f"（{config.PET_NAME}… 不想了~）"); self._thinking = None
         self._busy(False)
 
     # ---------- 显示 ----------

@@ -391,8 +391,8 @@ class PikachuPet(QWidget):
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # D特效①:放电边缘微光(画在角色下层,作为背景光晕)
-        if config.FX_GLOW_ENABLED and self._state in ("happy", "cheer"):
+        # D特效①:放电边缘微光(画在角色下层,作为背景光晕)。触发状态来自数据包。
+        if config.FX_GLOW_ENABLED and self._state in config.PET_GLOW_STATES:
             self._paint_glow(p)
 
         p.setFont(self.font)
@@ -407,24 +407,27 @@ class PikachuPet(QWidget):
         y0 = self.PAD + self.BUBBLE_TOP_RESERVE + self._line_h
         cw, lh = self._char_w, self._line_h
 
-        YELLOW = QColor(255, 213, 30)
-        GLOW = QColor(40, 30, 0, 150)
-        RED = QColor(232, 60, 60)
+        # 配色来自当前宝可梦数据包(换宝可梦即换色:火宝可梦=橙+🔥 等)。
+        BODY = QColor(*config.PET_BODY_COLOR)       # 主体(皮卡丘=雷电黄)
+        GLOW = QColor(40, 30, 0, 150)               # 描边阴影(通用,不随宝可梦变)
+        CHEEK = QColor(*config.PET_CHEEK_COLOR)     # 脸颊点 · 的颜色
+        ELEMENT = QColor(*config.PET_ELEMENT_COLOR)  # 元素符号色(皮卡丘=蓝白电花)
+        element_char = config.PET_ELEMENT_CHAR
 
-        # 逐字符绘制(发光描边 + 上色:电花偏蓝白,其余=雷电黄)
+        # 逐字符绘制(发光描边 + 上色:元素符号→元素色,脸颊点→脸颊色,其余→主体色)
         for line_i, line in enumerate(lines):
             y = y0 + line_i * lh
             for col_i, ch in enumerate(line):
                 if ch == " ":
                     continue
                 x = x0 + col_i * cw
-                # 颜色规则:电花偏蓝白,脸颊红点,其余雷电黄
-                if ch in "⚡":
-                    color = QColor(120, 200, 255)
+                # 字符渲染协议(见 pokedex/pikachu.py 文件头):
+                if ch == element_char:
+                    color = ELEMENT
                 elif ch == "·":
-                    color = RED
+                    color = CHEEK
                 else:
-                    color = YELLOW
+                    color = BODY
                 # 描边
                 p.setPen(GLOW)
                 for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
@@ -444,14 +447,16 @@ class PikachuPet(QWidget):
         p.end()
 
     def _paint_glow(self, p):
-        """放电时:窗口中心一圈淡黄径向光晕。"""
+        """兴奋/放电时:窗口中心一圈径向光晕。基色取自数据包(随宝可梦变)。"""
         from PyQt6.QtGui import QRadialGradient
         cx, cy = self._win_w / 2, self._win_h / 2 + 15
         radius = max(self._content_w, self._content_h) * 0.75
+        gr, gg, gb = config.PET_GLOW_COLOR
         g = QRadialGradient(cx, cy, radius)
-        g.setColorAt(0.0, QColor(255, 230, 80, 70))
-        g.setColorAt(0.6, QColor(255, 220, 60, 30))
-        g.setColorAt(1.0, QColor(255, 220, 60, 0))
+        # 同一基色三档 alpha 渐变:中心较亮、外缘透明(原皮卡丘黄观感保持一致)。
+        g.setColorAt(0.0, QColor(gr, gg, gb, 70))
+        g.setColorAt(0.6, QColor(gr, gg, gb, 30))
+        g.setColorAt(1.0, QColor(gr, gg, gb, 0))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(g)
         p.drawEllipse(int(cx - radius), int(cy - radius),
@@ -475,14 +480,16 @@ class PikachuPet(QWidget):
     def _paint_particles(self, p):
         """画心情粒子,按剩余寿命淡出。"""
         p.setFont(self.font)
+        er, eg, eb = config.PET_ELEMENT_COLOR
         for pt in self._particles:
             alpha = int(255 * max(0.0, pt["life"] / pt["max"]))
             ch = pt["ch"]
-            if ch == "✨":
+            # 元素符号粒子跟随数据包的元素色;✨(开心)金黄、💧(沮丧)蓝为通用情绪色。
+            if ch == config.PET_ELEMENT_CHAR:
+                col = QColor(er, eg, eb, alpha)
+            elif ch == "✨":
                 col = QColor(255, 240, 150, alpha)
-            elif ch == "⚡":
-                col = QColor(120, 200, 255, alpha)
-            else:  # 💧
+            else:  # 💧 及其它
                 col = QColor(120, 180, 255, alpha)
             p.setPen(col)
             p.drawText(int(pt["x"]), int(pt["y"]), ch)
@@ -818,7 +825,7 @@ class PikachuPet(QWidget):
             return
         icon = QIcon(config.HD_PATH) if os.path.exists(config.HD_PATH) else QIcon()
         self.tray = QSystemTrayIcon(icon, self)
-        self.tray.setToolTip("皮卡丘桌宠 ⚡(右键我也能退出)")
+        self.tray.setToolTip(config.PET_TRAY_TOOLTIP)
         self.tray.setContextMenu(self._build_menu())
         self.tray.activated.connect(
             lambda r: self.open_chat() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
@@ -925,15 +932,20 @@ class PikachuPet(QWidget):
     def _tick_particles(self):
         """每帧更新粒子(上浮/下落 + 淡出),并在进入 happy/cheer/sad 时生成。"""
         if config.FX_MOOD_ENABLED:
-            # 检测"刚进入"某情绪态(状态变化沿),生成一批粒子
+            # 检测"刚进入"某情绪态(状态变化沿),生成一批粒子。
+            # 各情绪态用的粒子符号来自数据包 PET_MOOD_PARTICLES(状态→符号)。
             if self._state != self._mood_prev_state:
+                mood = config.PET_MOOD_PARTICLES
                 if self._state in ("happy", "cheer"):
+                    # 开心/欢呼:上浮的"喜悦"符号(happy 取该状态符号;cheer 更夸张)
                     n = 6 if self._state == "cheer" else 4
-                    self._spawn_mood("✨", n, rising=True)
+                    self._spawn_mood(mood.get("happy", "✨"), n, rising=True)
+                    # 欢呼额外撒一把元素符号(放电感),符号取 cheer 配置 / 退回元素符号
                     if self._state == "cheer":
-                        self._spawn_mood("⚡", 3, rising=True)
+                        self._spawn_mood(
+                            mood.get("cheer", config.PET_ELEMENT_CHAR), 3, rising=True)
                 elif self._state == "sad":
-                    self._spawn_mood("💧", 4, rising=False)
+                    self._spawn_mood(mood.get("sad", "💧"), 4, rising=False)
         self._mood_prev_state = self._state
 
         # 推进现有粒子
@@ -1024,7 +1036,7 @@ class PikachuPet(QWidget):
             self._sched_last_fired.pop(task["id"], None)
             self.show_bubble(
                 f"*挠头* 「{task.get('desc','任务')[:10]}」存档出错,"
-                "皮卡先不动手,等会儿再试~", sticky=True)
+                f"{config.PET_NAME}先不动手,等会儿再试~", sticky=True)
             return
         self._run_scheduled_task(task)
 
@@ -1186,7 +1198,7 @@ class PikachuPet(QWidget):
                 # 头+尾截断:长命令只截中间,保住开头(命令名)和结尾(常是要删的
                 # 目标路径)。否则只留前 44 字会把"删的是哪里"这个最关键信息切掉。
                 shown = self._shorten_command(command, 48)
-                text = f"⚠️ 皮卡丘要{verb}\n「{shown}」\n—— 不可逆操作!"
+                text = f"⚠️ {config.PET_NAME}要{verb}\n「{shown}」\n—— 不可逆操作!"
                 widget = _ConfirmBubble(text, self)
                 # 用默认参数绑定 req_id,避免闭包晚绑定取到循环末值。
                 widget.allowed.connect(
@@ -1318,7 +1330,7 @@ class PikachuPet(QWidget):
             self._remove_confirm(rid)
         if expired:
             # 已超时 → hook 早自动 deny 了,告诉用户一声(普通气泡,会自动消失)
-            self.show_bubble("*耳朵耷拉* 等太久啦,那个操作皮卡丘先没做哦~", sticky=False)
+            self.show_bubble(f"*耳朵耷拉* 等太久啦,那个操作{config.PET_NAME}先没做哦~", sticky=False)
 
     def _remove_confirm(self, req_id):
         """从所有结构里移除一条待确认 + 销毁其 overlay + 递减 await 计数。决策由调用方先写。"""
@@ -1394,7 +1406,7 @@ class PikachuPet(QWidget):
             # 同时往聊天窗补一条皮卡丘口吻的提醒记录:用户常在聊天窗里建提醒,
             # 到点却只在本体冒气泡、聊天窗空白(体验断层)。本地拼模板、不调 claude,
             # 走互锁:聊天窗开着且空闲就直接写,否则暂存等空了/重开窗补写。
-            bubble = f"*蹦到你面前* {desc[:24]} 时间到啦!皮卡有叫你哦~ ⚡"
+            bubble = f"*蹦到你面前* {desc[:24]} 时间到啦!{config.PET_NAME}有叫你哦~ ⚡"
             self._deliver_to_chat(bubble)
             return
 
@@ -1403,19 +1415,19 @@ class PikachuPet(QWidget):
         # W6:任务没写要做什么(prompt 空),别冒"开工"后无下文,给一句兜底
         if not raw:
             self._flash_state("sad", 1800)
-            self.show_bubble(f"*挠头* 「{desc[:12]}」要做啥呀?皮卡没记清…", sticky=True)
+            self.show_bubble(f"*挠头* 「{desc[:12]}」要做啥呀?{config.PET_NAME}没记清…", sticky=True)
             return
 
         # W2 资源护栏:并发名额已在 _check_scheduled 把关(满额则不消耗触发、
         # 下一轮重试)。这里再做一次防御性兜底:万一被直接调用且已满,不超额起,
         # 冒提示而非硬起一个超限子进程。
         if self._alive_workers() >= config.MAX_CONCURRENT_SCHED_WORKERS:
-            self.show_bubble(f"⚡ 皮卡丘忙不过来,稍等下再做「{desc[:10]}」", sticky=True)
+            self.show_bubble(f"⚡ {config.PET_NAME}忙不过来,稍等下再做「{desc[:10]}」", sticky=True)
             return
 
         # 开工提示停久一点(8s):此前 2.6s 一闪而过,用户常没看清就没了。任务跑
         # 完会有 sticky 完成气泡接上,所以这里不必常驻,8s 足够看清又不长期挡头顶。
-        self.show_bubble(f"⚡ 皮卡丘开工:{desc[:12]}", ms=8000)
+        self.show_bubble(f"⚡ {config.PET_NAME}开工:{desc[:12]}", ms=8000)
         # W5:执行期间维持"think(挠头干活)"态,worker 完成才退出 ——
         # 让用户看出后台真的在忙,而不是 happy 2.2s 后就回去随机玩耍。
         self._flash_state("think", 600000)
@@ -1427,7 +1439,7 @@ class PikachuPet(QWidget):
             "不要把它当成新的定时任务来记录】\n"
             f"任务内容:{raw}\n"
             "请现在就用你的实际能力(读写文件、运行命令等)真正完成它,"
-            "完成后用皮卡丘口吻简短汇报结果。"
+            f"完成后用{config.PET_NAME}口吻简短汇报结果。"
         )
         worker = ClaudeWorker(prompt, history=None)
         worker.succeeded.connect(lambda r, t=task: self._on_sched_done(t, r))
@@ -1455,7 +1467,7 @@ class PikachuPet(QWidget):
         self._flash_state("cheer", 2600)   # 任务成功:大放电庆祝(思考中不打断)
         desc = task.get("desc", "任务")
         # 完成也用常驻气泡,点击确认才消失(免得你没看到)。提示可去聊天窗看详情。
-        self.show_bubble(f"✅ 完成「{desc[:14]}」(双击我看皮卡丘做了啥)", sticky=True)
+        self.show_bubble(f"✅ 完成「{desc[:14]}」(双击我看{config.PET_NAME}做了啥)", sticky=True)
         # 加一行 ⏰ 标记前缀(只标"这是哪条定时任务",不重复结果措辞)+ claude 的
         # 真实汇报。此前的旧前缀是"定时任务「…」搞定啦!⚡",和 reply 里的"搞定啦"
         # 撞车看着像说两遍;改成纯 ⏰+任务描述,既点明出处又不和 reply 内容重复。
@@ -1658,10 +1670,10 @@ class PikachuPet(QWidget):
         """
         if ok:
             self._flash_state("cheer", 2400)
-            self.show_bubble("💡 皮卡丘想好啦!双击我看回复~", sticky=True)
+            self.show_bubble(f"💡 {config.PET_NAME}想好啦!双击我看回复~", sticky=True)
         else:
             self._flash_state("sad", 2000)
-            self.show_bubble("⚠️ 皮卡丘卡住了…双击我看看", sticky=True)
+            self.show_bubble(f"⚠️ {config.PET_NAME}卡住了…双击我看看", sticky=True)
 
     # ---------- 情境:思考态 ----------
     def _enter_thinking(self):
@@ -1740,7 +1752,7 @@ class PikachuPet(QWidget):
         from datetime import datetime
         convo = "\n".join(
             f"[{PikachuPet._fmt_convo_ts(r.get('ts'))}] "
-            f"{'主人' if r.get('role') == 'user' else '皮卡丘'}：{r.get('text', '')}"
+            f"{'主人' if r.get('role') == 'user' else config.PET_NAME}：{r.get('text', '')}"
             for r in rows)
         existing_txt = "\n".join(
             f"- [{m.get('type')}] {m.get('text')}"
@@ -1749,7 +1761,7 @@ class PikachuPet(QWidget):
         now = datetime.now()
         wd = "一二三四五六日"[now.weekday()]
         return (
-            "你是皮卡丘桌面宠物的【记忆整理助手】。从最近这段对话里提炼出【真正值得长期"
+            f"你是{config.PET_NAME}桌面宠物的【记忆整理助手】。从最近这段对话里提炼出【真正值得长期"
             "记住】的信息,并和已有记忆对照——避免重复、及时更新过时内容、标记已完成的事。\n"
             f"当前时间:{now.strftime('%Y-%m-%d %H:%M')} 星期{wd}\n"
             "下面每行对话前方括号里是这句话【实际发生的时刻】,据此理解时间。\n\n"
@@ -1777,7 +1789,7 @@ class PikachuPet(QWidget):
             "严格过滤(不符合的一律【不记】,该数组就留空):\n"
             "  × 寒暄、客套、感谢、问候(「你好」「谢谢」「好的」「在吗」)\n"
             "  × 只在这段对话出现一次、明显不会再提的临时话题\n"
-            "  × 皮卡丘自己说的话(只记【主人】的情况,不记皮卡丘的)\n"
+            f"  × {config.PET_NAME}自己说的话(只记【主人】的情况,不记{config.PET_NAME}的)\n"
             "  × 已有记忆里已有相同或高度近似的内容(直接省略,别重复 add)\n"
             "  × 这段对话里主人已经做完的事:放进 done,不要 add\n\n"
             "用好时间:todo / routine 把发生时刻写进 text(如「06-19 说要写量化回测脚本,"
@@ -1816,10 +1828,11 @@ class PikachuPet(QWidget):
             print(f"[pet] 写入记忆失败:{exc}")
             return
         # 整理完顺手截断流水(超限才动)。放在游标已推进之后做:被截断丢弃的都是
-        # 已整理过的旧对话,安全。注意这里仍在 UI 线程,但只有【超过上限】才会真正
-        # 持锁+fsync——常态零开销(只数行数);真要截断时一次性代价可接受(罕见)。
+        # 已整理过的旧对话,安全。用 singleShot(0) 推到事件循环下一轮执行,避免
+        # 文件 IO(flock/fsync)在 UI 线程阻塞帧渲染——平时几乎不执行(只有超限才真正
+        # 持锁),但偶发时会让主线程卡顿,推后一拍代价极低。
         try:
-            memory.maybe_truncate_convo()
+            QTimer.singleShot(0, self._deferred_truncate_convo)
         except Exception:
             pass
 
@@ -1830,6 +1843,13 @@ class PikachuPet(QWidget):
         except Exception:
             pass
         print(f"[pet] 后台整理失败(已跳过本批对话):{err[:120]}")
+
+    def _deferred_truncate_convo(self):
+        """在事件循环空闲时执行对话流水截断(避免 flock/fsync 在 UI 线程阻塞)。"""
+        try:
+            memory.maybe_truncate_convo()
+        except Exception:
+            pass
 
     # ---------- 主动搭话(独立于记忆整理的一条线)----------
     def _check_proactive(self):
@@ -1915,7 +1935,7 @@ class PikachuPet(QWidget):
         else:
             slot = "深夜"
         return (
-            "你是一只桌面宠物皮卡丘。现在主人没在和你说话,你在考虑【要不要主动冒个泡打招呼】。\n"
+            f"你是一只桌面宠物{config.PET_NAME}。现在主人没在和你说话,你在考虑【要不要主动冒个泡打招呼】。\n"
             f"当前时间:{now.strftime('%Y-%m-%d %H:%M')} 星期{wd}({slot})\n\n"
             + mem_summary + "\n\n"
             "请判断:【现在】主动说一句,是否真的有意义、不会让主人觉得烦?\n\n"
@@ -1930,14 +1950,14 @@ class PikachuPet(QWidget):
             "  - 只是「想陪主人」「有点无聊」——这理由不够,别打扰人;\n"
             "  - 拿不准、犹豫——默认 false。\n\n"
             "只输出一个 JSON 对象,不要解释、不要代码块标记(```):\n"
-            '{"should": true或false, "topic": "should=true 时填一句皮卡丘要说的话;false 时填空字符串"}\n\n'
+            '{"should": true或false, "topic": "should=true 时填一句' + config.PET_NAME + '要说的话;false 时填空字符串"}\n\n'
             "topic 写法(should=true 时):\n"
             "  - 不超过 25 个字;\n"
             "  - 不要以「主人」开头,不要「有没有」「请问」这类客套;\n"
             "  - 随内容变换切入方式,别每次都同一个句式;\n"
             "  - 像一只真的小动物在想你,不像客服在催进度。可带 *动作*、~、少量 ⚡。\n"
             "  参考句式(只学语气,别照抄):\n"
-            "    「那个脚本…写完了嘛~⚡ 皮卡一直惦记着」\n"
+            "    「那个脚本…写完了嘛~ 一直惦记着呢」\n"
             "    「*歪头* 都这个点了,你还没去吃饭?」\n"
             "    「*耳朵动了动* 你上次说想看的那本,看了没呀~」\n"
         )
@@ -2096,7 +2116,7 @@ class PikachuPet(QWidget):
         # 「QThread: Destroyed while thread is still running」+ claude 子进程变孤儿。
         workers += list(self._memory_workers)
         if self._chat is not None:
-            if self._chat._worker is not None:
+            if getattr(self._chat, "_worker", None) is not None:
                 workers.append(self._chat._worker)
             # 取消后被孤儿化、仍在跑的 chat worker 也要 join,否则退出时它仍运行 →
             # 「QThread: Destroyed while thread is still running」+ claude 子进程变孤儿。

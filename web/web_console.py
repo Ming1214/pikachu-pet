@@ -52,7 +52,11 @@ def start(pet):
     url = f"http://{host}:{real_port}/?token={_TOKEN}"
     t = threading.Thread(target=server.serve_forever, name="web-console", daemon=True)
     t.start()
-    print(f"⚡ 皮卡丘控制台已启动:{url}")
+    try:
+        _pet_name = config.PET_NAME
+    except Exception:
+        _pet_name = "宝可梦桌宠"
+    print(f"⚡ {_pet_name}控制台已启动:{url}")
     if not token_written:
         # 令牌文件没写成(只读目录/磁盘满):再显式提示一次,免得用户进不去又不知为何。
         print("[web console] 提示:令牌文件写入失败,请用上面这条带 token 的链接访问。")
@@ -72,8 +76,12 @@ def _write_token(token: str) -> bool:
     """把 token 写入文件(0600)。返回是否成功(失败由 start 显式提示用户用终端链接)。"""
     try:
         path = config.WEB_CONSOLE_TOKEN_PATH
-        with open(path, "w", encoding="utf-8") as f:
+        # 原子地以 0600 创建:用 os.open 直接指定权限位,避免先按 umask(常 0644)
+        # 建文件、再 chmod 之间存在"令牌一度全局可读"的竞态窗口(多用户机上会泄露)。
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(token)
+        # 文件已存在的旧档可能是 0644:再 chmod 一次收紧(O_CREAT 不改已存在文件的权限)。
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -165,19 +173,31 @@ def _build_status() -> dict:
         "last_call": last_call[0] if last_call else None,
         "model": getattr(config, "CLAUDE_MODEL", "") or "(CLI 默认)",
         "permission_mode": getattr(config, "CLAUDE_PERMISSION_MODE", ""),
+        "pet_name": getattr(config, "PET_NAME", "宝可梦桌宠"),
     }
 
 
 def _build_config() -> dict:
-    """当前可编辑项的值 + schema(前端据此渲染表单),附当前 overrides 集。"""
+    """当前可编辑项的值 + schema(前端据此渲染表单),附当前 overrides 集。
+
+    schema(config_schema.EDITABLE)是模块级常量,label/help 里写死了"皮卡丘"。这里
+    按当前 PET_NAME 动态替换人设项的 label/help,使切了宝可梦后控制台不再显示"皮卡丘人设"。
+    """
     ov = config.load_overrides_dict()
+    pet = getattr(config, "PET_NAME", "宝可梦")
     items = []
     for it in config_schema.EDITABLE:
-        items.append({
+        entry = {
             **it,
             "value": getattr(config, it["key"], None),
             "overridden": it["key"] in ov,   # 是否已被用户覆盖(非默认值)
-        })
+        }
+        # 人设项的 label/help 含固定"皮卡丘"字样 → 替换成当前宝可梦名。
+        if it["key"] == "PIKACHU_PERSONA":
+            entry["label"] = f"{pet}人设(system prompt)"
+            entry["help"] = (f"{pet}的性格与底线。改了下一条聊天即生效。"
+                             "清空恢复默认请用「恢复默认」。")
+        items.append(entry)
     return {"items": items}
 
 
@@ -203,11 +223,31 @@ def _apply_config(payload: dict) -> dict:
             ov[k] = v
             if config_schema.BY_KEY[k].get("needs_restart"):
                 restart_keys.append(k)
+        # 切了宝可梦:setattr 只改了 ACTIVE_POKEMON 本身,人设/名字/配色/气泡色这些
+        # 【派生常量】(PIKACHU_PERSONA/PET_NAME/...)还是旧宝可梦的值,必须调
+        # _apply_pack() 按新 ACTIVE_POKEMON 重载数据包、热刷新它们——否则切了宝可梦
+        # 但下一句聊天仍用旧人设(用户反馈的 bug)。避让本次同时被用户显式改过的项
+        # (如手动改了人设),不拿数据包覆盖用户自定义。动画帧仍需重启(已标 restart)。
+        if "ACTIVE_POKEMON" in coerced and hasattr(config, "_apply_pack"):
+            try:
+                config._apply_pack(skip_overridden=set(ov.keys()) - {"ACTIVE_POKEMON"})
+                if hasattr(config, "_refresh_memory_paths"):
+                    config._refresh_memory_paths()   # 记忆文件路径也切到新宝可梦
+            except Exception:
+                pass
         ok = config.save_overrides(ov)
         if not ok:
             # 落盘失败 → 回滚内存态,保持"内存与磁盘一致"
             for k, old in original.items():
                 setattr(config, k, old)
+            # 回滚后也要把派生常量刷回旧宝可梦(若刚才切过)
+            if "ACTIVE_POKEMON" in coerced and hasattr(config, "_apply_pack"):
+                try:
+                    config._apply_pack(skip_overridden=set(ov.keys()) - {"ACTIVE_POKEMON"})
+                    if hasattr(config, "_refresh_memory_paths"):
+                        config._refresh_memory_paths()
+                except Exception:
+                    pass
             raise ValueError("配置写盘失败,改动已撤销(请检查磁盘空间/权限)")
     return {"ok": True, "changed": list(coerced.keys()),
             "needs_restart": restart_keys}
@@ -243,6 +283,16 @@ def _memory_get() -> dict:
 # 不能用 load_memory()+save_memory() 两段独立持锁(中间窗口会被主线程 apply_digest
 # 穿插 → 丢数据/游标回退)。_file_lock 现已叠加进程内锁(见 memory._file_lock),
 # 与主线程整理真正互斥。这里直接用 memory 的 unlocked 版,自己包一层锁。
+#
+# 【宝可梦快照】:进入临界区前先把当前宝可梦的(锁/json/md)三条路径一次性解析好,
+# 整个 read-modify-write 都用这组快照路径——避免临界区内 ACTIVE_POKEMON 被控制台
+# 另一线程并发切换,导致"拿 A 的锁却读写 B 的文件"(锁路径与文件路径分裂)。
+def _snapshot_mem_paths():
+    """返回当前宝可梦的 (lock_path, json_path, md_path) 快照(同一时刻一致)。"""
+    mem_path, md_path, _convo = config.memory_paths()   # 同步解析,三者同属一只宝可梦
+    return mem_path + ".lock", mem_path, md_path
+
+
 def _memory_add(payload: dict) -> dict:
     """手动加一条记忆。payload: {type, text, weight?}。"""
     import time
@@ -261,15 +311,12 @@ def _memory_add(payload: dict) -> dict:
     item = {"id": _gen_mem_id(), "type": mtype, "text": text[:500],
             "created_at": now, "last_seen": now, "last_decay_at": now,
             "weight": max(0.1, min(3.0, weight)), "done": False}
-    with memory._file_lock(memory.MEMORY_LOCK_PATH):
-        data = memory._load_memory_unlocked()
+    lock_path, mem_path, md_path = _snapshot_mem_paths()
+    with memory._file_lock(lock_path):
+        data = memory._load_memory_unlocked(mem_path)
         data.setdefault("memories", []).append(item)
-        ok = memory._save_memory_unlocked(data)
-        if ok:
-            try:
-                memory.export_md(data)
-            except Exception:
-                pass
+        # _save_memory_unlocked 内部已写 md,无需再调 export_md(去重,省一次 IO)。
+        ok = memory._save_memory_unlocked(data, path=mem_path, md_path=md_path)
     return {"ok": ok, "item": item}
 
 
@@ -279,8 +326,9 @@ def _memory_update(payload: dict) -> dict:
     mid = payload.get("id")
     if not mid:
         raise ValueError("缺少记忆 id")
-    with memory._file_lock(memory.MEMORY_LOCK_PATH):
-        data = memory._load_memory_unlocked()
+    lock_path, mem_path, md_path = _snapshot_mem_paths()
+    with memory._file_lock(lock_path):
+        data = memory._load_memory_unlocked(mem_path)
         found = None
         for m in data.get("memories", []):
             if m.get("id") == mid:
@@ -300,12 +348,7 @@ def _memory_update(payload: dict) -> dict:
                 found["weight"] = max(0.1, min(3.0, float(payload["weight"])))
             except (TypeError, ValueError):
                 pass
-        ok = memory._save_memory_unlocked(data)
-        if ok:
-            try:
-                memory.export_md(data)
-            except Exception:
-                pass
+        ok = memory._save_memory_unlocked(data, path=mem_path, md_path=md_path)
     return {"ok": ok, "item": found}
 
 
@@ -315,17 +358,13 @@ def _memory_delete(payload: dict) -> dict:
     mid = payload.get("id")
     if not mid:
         raise ValueError("缺少记忆 id")
-    with memory._file_lock(memory.MEMORY_LOCK_PATH):
-        data = memory._load_memory_unlocked()
+    lock_path, mem_path, md_path = _snapshot_mem_paths()
+    with memory._file_lock(lock_path):
+        data = memory._load_memory_unlocked(mem_path)
         before = len(data.get("memories", []))
         data["memories"] = [m for m in data.get("memories", []) if m.get("id") != mid]
         removed = before - len(data["memories"])
-        ok = memory._save_memory_unlocked(data)
-        if ok:
-            try:
-                memory.export_md(data)
-            except Exception:
-                pass
+        ok = memory._save_memory_unlocked(data, path=mem_path, md_path=md_path)
     return {"ok": ok, "removed": removed}
 
 

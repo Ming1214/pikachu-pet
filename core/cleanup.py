@@ -148,21 +148,28 @@ def _remove_chat_upload_dirs():
     """
     import glob
     import re as _re
-    base = getattr(config, "BASE_DIR", "")
+    # 上传目录现收纳在 DATA_DIR 下(随其它运行时数据)。但【老版本】曾把它写在 BASE_DIR,
+    # 迁移到 data/ 后那些旧目录就成了没人扫的孤儿 → 两处都扫(DATA_DIR + 不同的 BASE_DIR)。
     own = os.getpid()
-    if not base:
+    bases = []
+    for attr in ("DATA_DIR", "BASE_DIR"):
+        b = getattr(config, attr, "")
+        if b and b not in bases:
+            bases.append(b)
+    if not bases:
         return
-    for d in glob.glob(os.path.join(base, ".chat_uploads_*")):
-        m = _re.search(r"\.chat_uploads_(\d+)$", d)
-        if not m:
-            continue
-        pid = int(m.group(1))
-        if pid != own and _pid_alive(pid):
-            continue            # 另一个仍存活实例的目录,保留
-        try:
-            shutil.rmtree(d, ignore_errors=True)
-        except Exception:
-            pass
+    for base in bases:
+        for d in glob.glob(os.path.join(base, ".chat_uploads_*")):
+            m = _re.search(r"\.chat_uploads_(\d+)$", d)
+            if not m:
+                continue
+            pid = int(m.group(1))
+            if pid != own and _pid_alive(pid):
+                continue            # 另一个仍存活实例的目录,保留
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
 
 
 def _pid_alive(pid: int) -> bool:

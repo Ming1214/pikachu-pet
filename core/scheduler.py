@@ -36,7 +36,7 @@ try:
 except ImportError:                    # pragma: no cover
     fcntl = None
 
-TASKS_PATH = os.path.join(config.BASE_DIR, "scheduled_tasks.json")
+TASKS_PATH = os.path.join(config.DATA_DIR, "scheduled_tasks.json")
 LOCK_PATH = TASKS_PATH + ".lock"       # 跨进程排他锁文件(flock 用)
 
 _WEEKDAYS = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
@@ -740,7 +740,10 @@ def purge_old_done(max_age_sec: int = 6 * 3600):
         kept = [t for t in tasks
                 if not (t.get("done") and now - t.get("done_at", 0) > max_age_sec)]
         if len(kept) != len(tasks) or changed:
-            save_tasks(kept)
+            if not save_tasks(kept):
+                # 写盘失败:本轮的过期标记/清理只在内存,下轮 load 又是旧状态会重做。
+                # 无害(幂等),但留痕便于排查磁盘满/权限问题(与 after_fire 一致)。
+                print("[scheduler] ⚠️ purge_old_done 写盘失败,本轮清理未持久化")
 
 
 def describe(task: dict) -> str:

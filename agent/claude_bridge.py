@@ -225,10 +225,10 @@ def _scheduling_hint() -> str:
         "你要自己把口语时间(今晚、下周三、等会儿、半小时后…)理解成结构化参数,"
         "调用 schedule_task。判断要不要执行:只是想让你记着提醒他→mode=reminder;"
         "要你真去干活(写文件/整理/提交)→mode=action。\n"
-        "若用户有提醒意图但没说具体时间(如「提醒我订火锅店」),先用皮卡丘口吻反问"
+        f"若用户有提醒意图但没说具体时间(如「提醒我订火锅店」),先用{config.PET_NAME}口吻反问"
         "「*歪头* 啥时候提醒你呀?」,等他给了时间再建任务,别瞎猜时间。\n"
         "如果用户只是普通聊天或让你做一次性的事(不涉及定时),就正常回应/执行,"
-        "不要调用定时工具。建完任务用皮卡丘口吻自然告诉用户记下了。\n"
+        f"不要调用定时工具。建完任务用{config.PET_NAME}口吻自然告诉用户记下了。\n"
         "【重要】当用户说「删掉它/取消那个/改一下提醒/把刚才那个删了」这类指令时,"
         "不要凭空说'没有任务'——先调用 list_tasks 看看实际有哪些任务,"
         "结合上文对话判断'它'指哪条,再调 delete_task 删除。"
@@ -361,7 +361,7 @@ def _build_prompt(
     """
     file_hint = (
         "\n（提示:我这条消息里包含文件,上面用方括号标了它的绝对路径。"
-        "请你先用 Read 工具读取那个路径把内容看清楚,再用皮卡丘的口吻回应我。）"
+        f"请你先用 Read 工具读取那个路径把内容看清楚,再用{config.PET_NAME}的口吻回应我。）"
         if has_file else "")
     if not history:
         return user_text + file_hint
@@ -500,7 +500,7 @@ def ask_pikachu(
         # 假装看过,如实报错让用户重发。(部分失败则已在 content_blocks 里跳过坏的那张。)
         if not got_image:
             _log_call("chat", _t0, False, _plen, 0)
-            raise ClaudeError("皮卡丘没能打开你发的图片(文件可能已不在了),再发一次试试?")
+            raise ClaudeError(f"{config.PET_NAME}没能打开你发的图片(文件可能已不在了),再发一次试试?")
         user_msg = {"type": "user",
                     "message": {"role": "user", "content": blocks}}
         stdin_data = json.dumps(user_msg, ensure_ascii=False) + "\n"
@@ -622,7 +622,7 @@ def ask_pikachu(
         done.wait(timeout=3)
         _log_call("chat", _t0, False, _plen, 0)
         raise ClaudeError(
-            f"皮卡丘想了太久(超过 {config.CLAUDE_TIMEOUT_SEC} 秒)…可以让它做小一点的任务。"
+            f"{config.PET_NAME}想了太久(超过 {config.CLAUDE_TIMEOUT_SEC} 秒)…可以让它做小一点的任务。"
         )
 
     # 复查取消:done.wait 返回与 cancel 置位可能在同一窗口内竞态——若用户刚点了取消、
@@ -639,7 +639,7 @@ def ask_pikachu(
     if proc.returncode != 0:
         detail = (stderr or stdout or "未知错误").strip()
         _log_call("chat", _t0, False, _plen, 0)
-        raise ClaudeError(f"皮卡丘卡住了:{detail[:300]}")
+        raise ClaudeError(f"{config.PET_NAME}卡住了:{detail[:300]}")
 
     reply = ""
     if has_image:
@@ -647,20 +647,20 @@ def ask_pikachu(
         reply, is_err = _extract_stream_result(stdout)
         if is_err:
             _log_call("chat", _t0, False, _plen, 0)
-            raise ClaudeError(f"皮卡丘报错了:{reply[:300] or '未知错误'}")
+            raise ClaudeError(f"{config.PET_NAME}报错了:{reply[:300] or '未知错误'}")
     else:
         try:
             data = json.loads(stdout)
             if data.get("is_error"):
                 _log_call("chat", _t0, False, _plen, 0)
-                raise ClaudeError(f"皮卡丘报错了:{str(data.get('result', '未知错误'))[:300]}")
+                raise ClaudeError(f"{config.PET_NAME}报错了:{str(data.get('result', '未知错误'))[:300]}")
             reply = (data.get("result") or "").strip()
         except json.JSONDecodeError:
             reply = stdout.strip()
 
     if not reply:
         _log_call("chat", _t0, False, _plen, 0)
-        raise ClaudeError("皮卡丘张了张嘴,但什么也没说出来(空回复)。")
+        raise ClaudeError(f"{config.PET_NAME}张了张嘴,但什么也没说出来(空回复)。")
     _log_call("chat", _t0, True, _plen, len(reply))
     return reply
 

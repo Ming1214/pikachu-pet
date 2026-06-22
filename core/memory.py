@@ -39,12 +39,56 @@ try:
 except ImportError:                    # pragma: no cover
     fcntl = None
 
-MEMORY_PATH = config.MEMORY_PATH
-MEMORY_MD_PATH = config.MEMORY_MD_PATH
-CONVO_LOG_PATH = config.CONVO_LOG_PATH
-# 记忆库与对话流水各自独立的跨进程锁文件(与 scheduler 的锁互不干扰)。
-MEMORY_LOCK_PATH = MEMORY_PATH + ".lock"
-CONVO_LOCK_PATH = CONVO_LOG_PATH + ".lock"
+# 记忆按宝可梦隔离:文件路径不再在模块加载时固化,而是【每次读写时】按当前
+# config.ACTIVE_POKEMON 动态解析(见下面的解析函数)。这样控制台在线切换宝可梦后,
+# 记忆立刻读写到对应文件,无需重启。锁路径同步随之而变(每只一套独立锁)。
+#
+# 兼容:历史上外部代码可能 `from memory import MEMORY_PATH`/`memory.MEMORY_LOCK_PATH`。
+# web_console.py 就用了 memory.MEMORY_LOCK_PATH。为不破坏这些引用,保留同名【模块属性】,
+# 但通过 __getattr__ 动态返回当前宝可梦的路径(PEP 562 模块级 __getattr__),而非静态固化。
+
+
+def _mem_path() -> str:
+    """当前宝可梦的记忆库 json 绝对路径(运行时解析)。"""
+    return config.memory_paths()[0]
+
+
+def _md_path() -> str:
+    """当前宝可梦的 memory.md 绝对路径。"""
+    return config.memory_paths()[1]
+
+
+def _convo_path() -> str:
+    """当前宝可梦的对话流水 jsonl 绝对路径。"""
+    return config.memory_paths()[2]
+
+
+def _mem_lock_path() -> str:
+    """当前宝可梦记忆库的跨进程锁文件路径。"""
+    return _mem_path() + ".lock"
+
+
+def _convo_lock_path() -> str:
+    """当前宝可梦对话流水的跨进程锁文件路径。"""
+    return _convo_path() + ".lock"
+
+
+# PEP 562:模块级 __getattr__ 让 memory.MEMORY_PATH 等老属性仍可用,且【动态】反映
+# 当前宝可梦(取代旧的模块加载时固化)。只兜底这几个历史名,其余未知属性照常报错。
+_DYNAMIC_ATTRS = {
+    "MEMORY_PATH": _mem_path,
+    "MEMORY_MD_PATH": _md_path,
+    "CONVO_LOG_PATH": _convo_path,
+    "MEMORY_LOCK_PATH": _mem_lock_path,
+    "CONVO_LOCK_PATH": _convo_lock_path,
+}
+
+
+def __getattr__(name):
+    fn = _DYNAMIC_ATTRS.get(name)
+    if fn is not None:
+        return fn()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # 记忆类型(给 claude 提示用,也用于 md 分组)。
 MEM_TYPES = ("fact", "preference", "todo", "routine", "topic")
@@ -165,7 +209,7 @@ def append_convo(role: str, text: str) -> None:
         {"ts": time.time(), "role": role, "text": text[:2000]},
         ensure_ascii=False) + "\n"
     try:
-        with open(CONVO_LOG_PATH, "a", encoding="utf-8") as f:
+        with open(_convo_path(), "a", encoding="utf-8") as f:
             f.write(line)
     except OSError as exc:
         print(f"[memory] 对话流水追加失败:{exc}")
@@ -183,7 +227,7 @@ def read_new_convo(cursor: int, max_lines: int | None = None) -> tuple[list[dict
     这样剩余行下一轮还能被读到——绝不丢对话。None=不限制。
     """
     try:
-        size = os.path.getsize(CONVO_LOG_PATH)
+        size = os.path.getsize(_convo_path())
     except OSError:
         return [], cursor
     if cursor > size:           # 文件被截断/重建 → 从头读
@@ -191,7 +235,7 @@ def read_new_convo(cursor: int, max_lines: int | None = None) -> tuple[list[dict
     if cursor == size:
         return [], cursor
     try:
-        with open(CONVO_LOG_PATH, "rb") as f:
+        with open(_convo_path(), "rb") as f:
             f.seek(cursor)
             chunk = f.read()
     except OSError:
@@ -231,28 +275,32 @@ def _truncate_convo(max_lines: int) -> None:
     cursor 也重置为新文件大小(认为旧内容已整理过/可弃),在锁内一并完成,避免
     截断后 cursor 仍指向旧大字节数 → read_new_convo 永远读不到东西。
     """
-    with _file_lock(CONVO_LOCK_PATH):
+    # 进锁前快照路径:截断的对话流水与随后重置 cursor 的记忆库必须同属一只宝可梦,
+    # 否则临界区内 ACTIVE_POKEMON 被切走会"截 A 的对话却把 B 的 cursor 清零"。
+    convo_path = _convo_path()
+    mem_path = _mem_path(); md_path = _md_path()
+    with _file_lock(convo_path + ".lock"):
         try:
-            with open(CONVO_LOG_PATH, "r", encoding="utf-8") as f:
+            with open(convo_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
         except OSError:
             return
         if len(lines) <= max_lines:
             return
         kept = lines[-max_lines:]
-        if _atomic_write(CONVO_LOG_PATH, "".join(kept)):
+        if _atomic_write(convo_path, "".join(kept)):
             # cursor 重置为截断后文件大小:旧内容(含未整理的)被丢弃,认账。
             new_size = sum(len(s.encode("utf-8")) for s in kept)
-            with _file_lock(MEMORY_LOCK_PATH):
-                data = _load_memory_unlocked()
+            with _file_lock(mem_path + ".lock"):
+                data = _load_memory_unlocked(mem_path)
                 data["convo_cursor"] = new_size
-                _save_memory_unlocked(data)
+                _save_memory_unlocked(data, path=mem_path, md_path=md_path)
 
 
 def maybe_truncate_convo() -> None:
     """便于 pet 轮询时顺手调用:超限才截断,平时几乎零开销(只数行数)。"""
     try:
-        with open(CONVO_LOG_PATH, "r", encoding="utf-8") as f:
+        with open(_convo_path(), "r", encoding="utf-8") as f:
             n = sum(1 for _ in f)
     except OSError:
         return
@@ -272,16 +320,19 @@ def _default_memory() -> dict:
     }
 
 
-def _load_memory_unlocked() -> dict:
-    """读 memory.json(不加锁,内部用)。不存在/损坏 → 默认空结构。
+def _load_memory_unlocked(path: str | None = None) -> dict:
+    """读记忆库 json(不加锁,内部用)。不存在/损坏 → 默认空结构。
 
+    path 省略时读【当前宝可梦】的库;显式传入时读指定库(供共享读合并别的宝可梦)。
     损坏时【不】静默当空返回后又被 save 覆写清空——返回默认结构但调用方应谨慎;
     这里至少打日志留痕(与 scheduler.load_tasks 一致)。补全缺失字段以兼容旧档。
     """
-    if not os.path.exists(MEMORY_PATH):
+    if path is None:
+        path = _mem_path()
+    if not os.path.exists(path):
         return _default_memory()
     try:
-        with open(MEMORY_PATH, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except Exception as exc:
         print(f"[memory] 记忆文件损坏无法读取(按空处理):{exc}")
@@ -295,32 +346,48 @@ def _load_memory_unlocked() -> dict:
     return base
 
 
-def _save_memory_unlocked(data: dict) -> bool:
-    """写 memory.json(不加锁,内部用)+ 同步导出 memory.md。"""
-    ok = _atomic_write(MEMORY_PATH, json.dumps(data, ensure_ascii=False, indent=2))
+def _save_memory_unlocked(data: dict, path: str = None, md_path: str = None) -> bool:
+    """写 memory.json(不加锁,内部用)+ 同步导出 memory.md。
+
+    path/md_path 省略时写【当前宝可梦】的库;显式传入时写指定库——供调用方在【进入
+    临界区前快照了宝可梦】的场景使用,避免临界区内 ACTIVE_POKEMON 被并发切换导致
+    "拿 A 的锁却写 B 的文件"(锁路径与文件路径分裂)。
+    """
+    if path is None:
+        path = _mem_path()
+    ok = _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
     if ok:
-        export_md(data)          # md 导出失败不影响主存(export_md 内部吞错)
+        export_md(data, path=md_path)   # md 导出失败不影响主存(export_md 内部吞错)
     return ok
 
 
 def load_memory() -> dict:
     """读记忆库(持锁)。"""
-    with _file_lock(MEMORY_LOCK_PATH):
+    with _file_lock(_mem_lock_path()):
         return _load_memory_unlocked()
 
 
 def save_memory(data: dict) -> bool:
     """写记忆库(持锁)。"""
-    with _file_lock(MEMORY_LOCK_PATH):
+    with _file_lock(_mem_lock_path()):
         return _save_memory_unlocked(data)
 
 
 # ───────────────────────────  导出 md  ───────────────────────────
-def export_md(data: dict) -> None:
-    """把 memories 按 type 分组写成 memory.md(人类可读)。失败吞掉不致命。"""
+def export_md(data: dict, path: str = None) -> None:
+    """把 memories 按 type 分组写成 memory.md(人类可读)。失败吞掉不致命。
+
+    path 省略时写【当前宝可梦】的 md;显式传入时写指定路径(与 _save_memory_unlocked
+    的快照路径配套,避免锁/文件分裂)。
+    """
     try:
         mems = data.get("memories", [])
-        lines = ["# 皮卡丘的记忆小本本 ⚡\n",
+        # 标题用当前宝可梦名(每只一份 md,各记各的)。取名失败兜底"宠物"。
+        try:
+            pet = config.PET_NAME
+        except Exception:
+            pet = "宠物"
+        lines = [f"# {pet}的记忆小本本 ⚡\n",
                  f"_(自动生成,共 {len(mems)} 条;最近整理 "
                  f"{_fmt_ts(data.get('last_digest_at'))})_\n"]
         for typ in MEM_TYPES:
@@ -340,7 +407,7 @@ def export_md(data: dict) -> None:
             lines.append("\n## 其他\n")
             for m in others:
                 lines.append(f"- {m.get('text', '')}")
-        _atomic_write(MEMORY_MD_PATH, "\n".join(lines) + "\n")
+        _atomic_write(path or _md_path(), "\n".join(lines) + "\n")
     except Exception as exc:
         print(f"[memory] 导出 md 失败(不影响主存):{exc}")
 
@@ -376,8 +443,12 @@ def apply_digest(updates: dict, new_cursor: int) -> bool:
     返回 True 仅当成功落盘。
     """
     now = time.time()
-    with _file_lock(MEMORY_LOCK_PATH):
-        data = _load_memory_unlocked()
+    # 进临界区前快照(锁/json/md)三条路径:整段 read-modify-write 都用这组快照,
+    # 避免临界区内 ACTIVE_POKEMON 被控制台另一线程并发切换 → "拿 A 的锁却写 B 的文件"
+    # (锁路径与文件路径分裂)。md 路径与 json 配套,一并快照传给 _save_memory_unlocked。
+    mem_path = _mem_path(); md_path = _md_path(); lock_path = mem_path + ".lock"
+    with _file_lock(lock_path):
+        data = _load_memory_unlocked(mem_path)
         mems = data["memories"]
         index = {_norm(m.get("text", "")): m for m in mems}
 
@@ -450,7 +521,7 @@ def apply_digest(updates: dict, new_cursor: int) -> bool:
         data["convo_cursor"] = new_cursor
         data["last_digest_at"] = now
         purge_memories(data)          # 老化 + 超量淘汰(就地修改 data)
-        return _save_memory_unlocked(data)
+        return _save_memory_unlocked(data, path=mem_path, md_path=md_path)
 
 
 def purge_memories(data: dict) -> None:
@@ -486,6 +557,61 @@ def purge_memories(data: dict) -> None:
     data["memories"] = mems
 
 
+# ───────────────────────────  注入用记忆收集(共享 / 隔离)  ───────────────────────────
+def _load_memory_file(path: str) -> dict:
+    """读指定路径的记忆库 json(持该文件自己的锁)。不存在/损坏 → 默认空结构。
+
+    用于【共享读】合并别的宝可梦的记忆库:每个文件用自己的锁,避免读 A 的库时
+    误用 B 的锁。复用 _load_memory_unlocked 的容错(它内部按传入路径读)。
+    """
+    with _file_lock(path + ".lock"):
+        return _load_memory_unlocked(path)
+
+
+def _collect_injection_memories() -> list[dict]:
+    """收集要注入聊天/搭话的记忆条目列表,按共享开关决定范围。
+
+    - MEMORY_SHARED_ACROSS_POKEMON=True:合并【所有宝可梦】的记忆库。同一件事被多只
+      记过(_norm 等价)只保留权重最高的那条,避免重复注入。
+    - False:只读【当前宝可梦】自己的库。
+    任何异常都降级为"只读当前库",绝不让共享逻辑的问题挡住聊天。
+    """
+    try:
+        shared = bool(getattr(config, "MEMORY_SHARED_ACROSS_POKEMON", True))
+    except Exception:
+        shared = True
+    if not shared:
+        try:
+            return load_memory().get("memories", []) or []
+        except Exception:
+            return []
+    # 共享:合并所有 memory*.json。按 _norm(text) 去重,留 weight 最高的一条。
+    merged: dict[str, dict] = {}
+    try:
+        paths = config.all_memory_json_paths()
+    except Exception:
+        paths = []
+    # 兜底:至少包含当前库(若 all_memory_json_paths 出错或为空)
+    if not paths:
+        try:
+            return load_memory().get("memories", []) or []
+        except Exception:
+            return []
+    for path in paths:
+        try:
+            data = _load_memory_file(path)
+        except Exception:
+            continue
+        for m in data.get("memories", []) or []:
+            key = _norm(m.get("text", ""))
+            if not key:
+                continue
+            cur = merged.get(key)
+            if cur is None or m.get("weight", 0.0) > cur.get("weight", 0.0):
+                merged[key] = m
+    return list(merged.values())
+
+
 # ───────────────────────────  注入聊天的记忆摘要  ───────────────────────────
 def recent_memory_summary(max_items: int | None = None) -> str:
     """取高权重记忆拼成一段文本,注入聊天 / 主动搭话 prompt(让皮卡丘"记得"主人)。
@@ -501,11 +627,8 @@ def recent_memory_summary(max_items: int | None = None) -> str:
     """
     if max_items is None:
         max_items = config.MEMORY_INJECT_TOP_N
-    try:
-        data = load_memory()
-    except Exception:
-        return ""
-    mems = data.get("memories", [])
+    # 按共享开关收集记忆:共享=合并所有宝可梦的库,隔离=只当前这只(内部已容错)。
+    mems = _collect_injection_memories()
     if not mems:
         return ""
     top = sorted(mems, key=lambda x: x.get("weight", 0.0), reverse=True)[:max_items]
@@ -548,7 +671,11 @@ def recent_memory_summary(max_items: int | None = None) -> str:
     if not parts:
         return ""
     body = "\n".join(f"- {p}" for p in parts)
-    return "【皮卡丘记得的关于主人的事(聊天时自然地用上,别当清单念出来)】\n" + body
+    try:
+        pet = config.PET_NAME
+    except Exception:
+        pet = "我"
+    return f"【{pet}记得的关于主人的事(聊天时自然地用上,别当清单念出来)】\n" + body
 
 
 # ───────────────────────────  主动搭话频率状态  ───────────────────────────
@@ -556,15 +683,17 @@ def record_proactive() -> None:
     """记一次主动搭话:更新 last_proactive_at 与当天计数。持锁。"""
     now = time.time()
     today = datetime.now().strftime("%Y%m%d")
-    with _file_lock(MEMORY_LOCK_PATH):
-        data = _load_memory_unlocked()
+    # 同 apply_digest:进锁前快照路径,防临界区内 ACTIVE_POKEMON 被切走导致锁/文件分裂。
+    mem_path = _mem_path(); md_path = _md_path(); lock_path = mem_path + ".lock"
+    with _file_lock(lock_path):
+        data = _load_memory_unlocked(mem_path)
         data["last_proactive_at"] = now
         if data.get("proactive_day") != today:
             data["proactive_day"] = today
             data["proactive_count"] = 1
         else:
             data["proactive_count"] = int(data.get("proactive_count", 0)) + 1
-        _save_memory_unlocked(data)
+        _save_memory_unlocked(data, path=mem_path, md_path=md_path)
 
 
 def proactive_count_today(data: dict | None = None) -> int:
