@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "pokemon-green-en",
+  "owner": "dev-jelly",
+  "repo": "pokemon-skills",
+  "path": ".claude/skills/pokemon-green-en",
+  "branch": "main",
+  "sha": "8b023cda58d4b2db3cafbb12b8c858e22cad3386",
+  "source": "manual"
+}
