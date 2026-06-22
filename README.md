@@ -19,7 +19,7 @@
 ![python](https://img.shields.io/badge/Python_3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![pyqt](https://img.shields.io/badge/PyQt6-41CD52?style=for-the-badge&logo=qt&logoColor=white)
 ![claude](https://img.shields.io/badge/Claude_Code-D97757?style=for-the-badge&logo=anthropic&logoColor=white)
-![version](https://img.shields.io/badge/version-0.1.0-FFD23F?style=for-the-badge)
+![version](https://img.shields.io/badge/version-0.2.0-FFD23F?style=for-the-badge)
 
 <br>
 
@@ -366,6 +366,17 @@ pikachu-pet/
 ---
 
 ## 📦 更新日志
+
+### v0.2.0 — 宝可梦数据包 🎒
+
+不止皮卡丘了!这一版把「形象」从代码里抽出来,变成可插拔的数据包,并随手做了一轮稳定性排查。
+
+- **🎒 17 只可换宝可梦** —— 内置 17 只手绘宝可梦(皮卡丘/妙蛙系/小火龙系/杰尼龟系/路卡利欧/青蛙忍者系…),控制台下拉即换形象/人设/配色;**每只各记各的记忆**(`memory_<名>.json`),换宝可梦像换了只新宠物。
+- **🧩 数据包架构** —— 帧/人设/台词/配色全搬进 [`pokedex/`](pokedex/README.md),`ascii_pika` 退化为薄转发层;加新宝可梦 = 照样板填一份数据包,**代码零改动**,附 ASCII 美术规范与数据包质检器。
+- **🔒 稳定性 & 安全修复** —— 修记忆库「锁/文件分裂」竞态(并发切宝可梦时可能写错文件)、Web 控制台发言者名 XSS、换宝可梦后人设串味、控制台 token 文件创建竞态、退出残留目录清理等若干问题。
+- **🧵 体验打磨** —— 对话流水截断改为事件循环空闲时异步执行,不再阻塞 UI 线程;聊天窗标题/输入框身份随宝可梦热刷新。
+
+> 升级无需迁移:老用户的皮卡丘记忆沿用原文件名,默认仍是皮卡丘。
 
 ### v0.1.0 — 首个版本 ⚡
 
