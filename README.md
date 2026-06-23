@@ -19,7 +19,7 @@
 ![python](https://img.shields.io/badge/Python_3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![pyqt](https://img.shields.io/badge/PyQt6-41CD52?style=for-the-badge&logo=qt&logoColor=white)
 ![claude](https://img.shields.io/badge/Claude_Code-D97757?style=for-the-badge&logo=anthropic&logoColor=white)
-![version](https://img.shields.io/badge/version-0.2.0-FFD23F?style=for-the-badge)
+![version](https://img.shields.io/badge/version-0.2.1-FFD23F?style=for-the-badge)
 
 <br>
 
@@ -366,6 +366,13 @@ pikachu-pet/
 ---
 
 ## 📦 更新日志
+
+### v0.2.1 — 多桌面体验修复 🖥️
+
+macOS 多桌面(Spaces)下的两处窗口行为修复:
+
+- **🪟 聊天窗跟随当前桌面** —— 以前聊天窗只待在打开它的那个桌面;现在和皮卡丘本体一样常驻所有桌面,你切到哪个桌面它都在。顺带修好了一个潜伏的行为位错值,聊天窗现在也能正确浮在全屏 App 之上。
+- **🔝 窗口层级稳定** —— 切到有其他 App 的桌面时,聊天窗不再被那个 App 短暂盖住(以前要点一下才浮上来)。固定层级:**皮卡丘 ASCII(最上) > 聊天窗 > 其他 App**,任何时候都成立。
 
 ### v0.2.0 — 宝可梦数据包 🎒
 
