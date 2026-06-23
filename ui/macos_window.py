@@ -8,6 +8,16 @@ import sys
 
 from PyQt6.QtWidgets import QApplication
 
+# ── 窗口层级档位(NSWindow level)────────────────────────────────────────────
+# 固定档,供本体 + 聊天窗共用,避免魔法数散落。期望栈序:普通 App(0) < 聊天窗 < 本体。
+# 【红线】本体必须 < 8(NSModalPanelWindowLevel):>=8 会浮到系统模态弹窗(文件选择
+# sheet、NSAlert)之上,把皮卡丘盖在系统对话框上、用户没法先关掉它 → 卡死;>=24 还会
+# 盖住菜单栏。7 是 <8 区间内的最高安全档,给"本体压住聊天窗"留出空间。
+# 注意:WindowStaysOnTopHint 默认映射出的 level 因 Qt/macOS 版本而异(实测可能是 8),
+# 所以必须显式 setLevel 把两者钉到这里的固定档,不能依赖默认值。
+CHAT_WINDOW_LEVEL = 5   # 聊天窗:floating 之上、稳压普通 App(0)
+PET_WINDOW_LEVEL = 7    # 本体:压住聊天窗(5),仍 < 8 不盖系统弹窗/菜单栏
+
 # setup_app_policy 只需生效一次。重复调用会反复调 setActivationPolicy:——在某些
 # macOS 版本上会触发 Dock/菜单栏状态重算(图标闪烁),且每次都重写 objc_msgSend
 # 的全局 argtypes,纯属多余。用模块级 flag 保证只跑一次。
@@ -38,10 +48,17 @@ def setup_app_policy():
         print(f"[macOS policy] 设置失败(非致命):{exc}")
 
 
-def join_all_spaces(widget):
-    """让窗口出现在所有 Space / 全屏 App 之上,且不随焦点消失。
+# NSWindowCollectionBehavior 行为位(值取自 AppKit 官方定义,别凭印象写)。
+# 易错点:FullScreenAuxiliary 是 1<<17,不是 1<<8——历史代码写错过,导致它从没真生效。
+_COLL_CAN_JOIN_ALL_SPACES = 1 << 0    # 同时出现在所有 Space(本体 + 聊天窗都用)
+_COLL_STATIONARY = 1 << 4             # Mission Control/Exposé 时不动位
+_COLL_FULLSCREEN_AUX = 1 << 17        # 可浮在全屏 App 的 Space 之上
 
-    CanJoinAllSpaces(1<<0) | Stationary(1<<4) | FullScreenAuxiliary(1<<8)
+
+def _set_collection_behavior(widget, behavior, tag):
+    """把某 widget 的 NSWindow.collectionBehavior 设成给定位掩码。失败不致命。
+
+    抽出公共骨架:平台守卫 + winId→NSView→window→setCollectionBehavior:。
     """
     if sys.platform != "darwin":
         return
@@ -61,14 +78,29 @@ def join_all_spaces(widget):
         if not ns_window:
             return
 
-        behavior = (1 << 0) | (1 << 4) | (1 << 8)
         msg_set = objc.objc_msgSend
         msg_set.restype = None
         msg_set.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
         msg_set(ns_window, objc.sel_registerName(b"setCollectionBehavior:"),
                 ctypes.c_ulong(behavior))
     except Exception as exc:
-        print(f"[macOS spaces] 设置失败(非致命):{exc}")
+        print(f"[macOS {tag}] 设置失败(非致命):{exc}")
+
+
+def join_all_spaces(widget):
+    """让窗口【常驻所有 Space】、浮在全屏 App 之上、不随焦点消失(本体 + 聊天窗都用)。
+
+    CanJoinAllSpaces | Stationary | FullScreenAuxiliary。
+    用 CanJoinAllSpaces(同时存在于所有桌面)而非 MoveToActiveSpace(仅显示那一刻
+    拉到当前桌面、之后切走不跟随):本体和聊天窗都要"你切到哪个桌面它都在",
+    所以两者用同一行为。Stationary 与 CanJoinAllSpaces 正交(只管 Mission Control
+    时不被卷走),不影响"常驻所有 Space"。
+    """
+    _set_collection_behavior(
+        widget,
+        _COLL_CAN_JOIN_ALL_SPACES | _COLL_STATIONARY | _COLL_FULLSCREEN_AUX,
+        "spaces",
+    )
 
 
 def set_window_level(widget, level):

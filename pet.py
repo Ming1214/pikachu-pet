@@ -381,9 +381,9 @@ class PikachuPet(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         macos_window.join_all_spaces(self)
-        # 本体 level 设得比聊天窗(3)高一档,保证 ASCII 皮卡丘永远浮在聊天窗之上,
-        # 不被刚打开/raise_ 的聊天窗盖住。和 raise 顺序无关,系统层面兜底。
-        macos_window.set_window_level(self, 5)
+        # 本体 level 钉到固定档(PET_WINDOW_LEVEL=7),比聊天窗(5)高、仍 <8 不盖系统
+        # 弹窗。保证 ASCII 皮卡丘永远浮在聊天窗之上,与 raise 顺序无关,系统层面兜底。
+        macos_window.set_window_level(self, macos_window.PET_WINDOW_LEVEL)
 
     # ---------- 绘制 ----------
     def paintEvent(self, event):
@@ -1615,26 +1615,27 @@ class PikachuPet(QWidget):
         self._flush_pending_results()
 
     def _reassert_pet_top(self):
-        """重新把本体钉到聊天窗之上:把本体 NSWindow level 设到【聊天窗实际 level 之上】
-        + Qt 层 raise_。
+        """把整条层级栈重钉好:普通 App(0) < 聊天窗(5) < 本体(7)。幂等、可重入。
 
-        关键修正:不再写死 pet=5。WindowStaysOnTopHint 在不同 Qt/macOS 版本映射到的
-        level 不一定(可能 3,也可能 25/101…)——若 chat 实际是 25 而 pet 死设 5,
-        pet 反被盖住(正是之前截图里的现象)。改为【读出 chat 的真实 level,把 pet 设到
-        它 +2】,与映射无关地保证本体在上;读不到则退回安全档 5。
+        分两步,固定档(不再读"聊天窗当前 level"去 +2——那是自我强化漂移:聊天窗 level
+        若被打回默认,本体跟着越设越高,而聊天窗自己永远没人拉回):
+          ① 先让聊天窗自己钉回 CHAT_WINDOW_LEVEL(5)并 raise(压住普通 App);
+          ② 再把本体钉到 PET_WINDOW_LEVEL(7)并 raise(压住聊天窗,仍 <8 不盖系统弹窗)。
 
-        幂等可重入:setLevel/raise_ 重复调无副作用。配合 open_chat 里同步 + singleShot
-        0/60ms 多次调,覆盖聊天窗 activateWindow 的异步时序。聊天窗没开/隐藏时跳过。
+        触发点:open_chat 同步 + singleShot 0/60ms(覆盖聊天窗 activate 异步时序)、
+        applicationStateChanged(App 重新激活)。setLevel/raise_ 重复调无副作用、不闪烁。
+        聊天窗没开/隐藏时跳过(此时只有本体,无需排栈)。
         """
         if self._chat is None or not self._chat.isVisible():
             return
+        # ① 聊天窗自己回到普通 App 之上(本体只负责压住聊天窗,不替它占层)。
         try:
-            chat_lvl = macos_window.get_window_level(self._chat)
+            self._chat.reassert_top()
         except Exception:
-            chat_lvl = None
-        pet_lvl = (chat_lvl + 2) if isinstance(chat_lvl, int) else 5
+            pass
+        # ② 本体钉到固定档,压在聊天窗之上。
         try:
-            macos_window.set_window_level(self, pet_lvl)
+            macos_window.set_window_level(self, macos_window.PET_WINDOW_LEVEL)
         except Exception:
             pass
         try:

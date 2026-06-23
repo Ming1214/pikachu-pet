@@ -358,12 +358,30 @@ class ChatWindow(QWidget):
                 f"和{config.PET_NAME}说点什么…(Enter 发送 / Option+Enter 换行)")
         except Exception:
             pass
+        # 聊天窗【常驻所有桌面】:和皮卡丘本体一样用 join_all_spaces(CanJoinAllSpaces)——
+        # 你切到哪个 Space 它都在,真正"跟着你走"。
+        # 不用 MoveToActiveSpace:那只在【显示那一刻】把窗拉到当前桌面,之后你切走它
+        # 不跟随、停在原地(用户反馈的"停在打开它的那个桌面不动"正是这个语义)。
         macos_window.join_all_spaces(self)
-        # 聊天窗 level 显式设为 3(= WindowStaysOnTopHint 在 Cocoa 下本就映射到的
-        # NSFloatingWindowLevel):严格说是冗余,但写明白意图——聊天窗浮在普通应用
-        # 之上、又比皮卡丘本体(5)低一档,本体的 ASCII 形象始终可见盖不住。
-        # 留作显式断言,万一日后 Qt 的映射变了,这行仍把它钉回 3。
-        macos_window.set_window_level(self, 3)
+        # 把聊天窗 level 钉到固定档(CHAT_WINDOW_LEVEL=5):浮在普通 App 之上、又比
+        # 本体(7)低一档。单一来源走 reassert_top(),切桌面/失活后由 pet 侧重断言复用。
+        self.reassert_top()
+
+    def reassert_top(self):
+        """把聊天窗钉回固定层级(>普通 App)并抬到最上。幂等、可重入,不闪烁。
+
+        与本体的 _reassert_pet_top 配套:本体只负责"压在聊天窗之上",聊天窗自己负责
+        "压在普通 App 之上"。切桌面/App 失活后,Qt 可能把 Tool 窗 level 打回默认 →
+        聊天窗掉到别的 App 后面(用户反馈的"切过去先被盖一下"),靠重断言拉回。
+        窗不可见时跳过(此时无需占层)。
+        """
+        if not self.isVisible():
+            return
+        try:
+            macos_window.set_window_level(self, macos_window.CHAT_WINDOW_LEVEL)
+            self.raise_()
+        except Exception:
+            pass
 
     def hideEvent(self, event):
         """收起/关闭聊天窗 = 只把窗藏起来,【不】中断正在跑的 claude。
