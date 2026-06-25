@@ -358,10 +358,23 @@ class ChatWindow(QWidget):
                 f"和{config.PET_NAME}说点什么…(Enter 发送 / Option+Enter 换行)")
         except Exception:
             pass
-        # 聊天窗【常驻所有桌面】:和皮卡丘本体一样用 join_all_spaces(CanJoinAllSpaces)——
-        # 你切到哪个 Space 它都在,真正"跟着你走"。
-        # 不用 MoveToActiveSpace:那只在【显示那一刻】把窗拉到当前桌面,之后你切走它
-        # 不跟随、停在原地(用户反馈的"停在打开它的那个桌面不动"正是这个语义)。
+        # 聊天窗【常驻所有桌面】+ 钉层级,收成单一入口 _apply_macos_window_behavior()。
+        # 同步先设一次(本体早已 mapped 的常态可即刻生效),再用 singleShot(0) 在事件循环
+        # 下一轮补设一次:聊天窗【首次】显示时,showEvent 同步触发于 show() 内部,此刻
+        # NSView 还没挂进 NSWindow,join_all_spaces 里 [view window] 返回 nil → CanJoinAllSpaces
+        # 设不上、聊天窗完全不跟随桌面(本次 BUG)。回到事件循环后 NSWindow 已就绪,补设必成。
+        self._apply_macos_window_behavior()
+        QTimer.singleShot(0, self._apply_macos_window_behavior)
+
+    def _apply_macos_window_behavior(self):
+        """常驻所有 Space(CanJoinAllSpaces)+ 钉固定层级。幂等、可重入。
+
+        统一入口:showEvent 同步调一次 + singleShot(0) 补一次,确保首次显示 NSWindow
+        就绪后 collectionBehavior 一定设上。窗不可见时跳过(此时无需占 Space/层)。
+        不用 MoveToActiveSpace:那只在显示那一刻把窗拉到当前桌面,之后切走不跟随。
+        """
+        if not self.isVisible():
+            return
         macos_window.join_all_spaces(self)
         # 把聊天窗 level 钉到固定档(CHAT_WINDOW_LEVEL=5):浮在普通 App 之上、又比
         # 本体(7)低一档。单一来源走 reassert_top(),切桌面/失活后由 pet 侧重断言复用。

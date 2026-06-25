@@ -76,6 +76,10 @@ def _set_collection_behavior(widget, behavior, tag):
         msg_p.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         ns_window = msg_p(view, objc.sel_registerName(b"window"))
         if not ns_window:
+            # 首次 showEvent 同步触发于 show() 内部,此刻 NSView 可能尚未挂进 NSWindow,
+            # [view window] 返回 nil → 这次设不上。调用方(聊天窗)用 singleShot(0) 在
+            # 事件循环下一轮 NSWindow 就绪后补设;这里打一行日志便于诊断,不改控制流。
+            print(f"[macOS {tag}] NSWindow 未就绪,跳过(将由延迟重试补设)")
             return
 
         msg_set = objc.objc_msgSend

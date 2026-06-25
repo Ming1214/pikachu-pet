@@ -19,7 +19,7 @@
 ![python](https://img.shields.io/badge/Python_3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![pyqt](https://img.shields.io/badge/PyQt6-41CD52?style=for-the-badge&logo=qt&logoColor=white)
 ![claude](https://img.shields.io/badge/Claude_Code-D97757?style=for-the-badge&logo=anthropic&logoColor=white)
-![version](https://img.shields.io/badge/version-0.2.1-FFD23F?style=for-the-badge)
+![version](https://img.shields.io/badge/version-0.2.2-FFD23F?style=for-the-badge)
 
 <br>
 
@@ -366,6 +366,15 @@ pikachu-pet/
 ---
 
 ## 📦 更新日志
+
+### v0.2.2 — 聊天窗跟随桌面(真正修好)🪟
+
+接着 v0.2.1 又揪出一处更隐蔽的时序坑:**聊天窗首次打开时根本没跟随桌面**——切到别的桌面后它整个留在原桌面、当前桌面看不到。
+
+- **🐛 根因:首帧 NSWindow 未就绪** —— 聊天窗第一次显示时,设「常驻所有桌面(CanJoinAllSpaces)」的代码在 `showEvent` 里同步执行,而那一刻底层 NSWindow 还没挂好,设置**静默失败**、行为位从没真生效。本体没事是因为它启动即常驻、窗口早就绪。
+- **✅ 修法:延迟补设** —— 聊天窗显示后多设一次(回到事件循环、NSWindow 就绪时),确保「常驻所有桌面」一定生效。零新增常驻定时器(只用一次性 `singleShot`)。顺带给那个静默失败点加了诊断日志,以后这类问题日志里看得见。
+
+> v0.2.1 修的是「跟随后被 App 盖住」(层级);这次修的是「压根没跟随」(行为位没设上)——两码事,各打各的。
 
 ### v0.2.1 — 多桌面体验修复 🖥️
 
