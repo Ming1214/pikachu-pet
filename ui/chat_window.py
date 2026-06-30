@@ -1239,18 +1239,26 @@ class ChatWindow(QWidget):
         d = re.sub(rf"^{re.escape(config.PET_NAME)}[,，、\s]*", "", d).strip()
         return d
 
-    def inject_pika_opening(self, text):
-        """主动搭话:把皮卡丘的一句开场白写进聊天窗(显示气泡 + 进历史 + 落流水),
+    def inject_pika_opening(self, text, log_convo=False):
+        """主动搭话:把皮卡丘的一句开场白写进聊天窗(显示气泡 + 进多轮历史)。
 
-        让用户点开主动气泡后,聊天窗里已经有皮卡丘先开了口,可直接接着聊,
-        且后续多轮上下文连贯(进了 self._history)。供 pet 在主动搭话点击后调用。
+        让用户(回头点开主动气泡 / 自己开窗时)聊天窗里已经有皮卡丘先开了口,可
+        直接接着聊,且后续多轮上下文连贯(进了 self._history)。供 pet 在主动搭话
+        【冒泡那一刻】调用(即时入对话,不必等点击)。
+
+        log_convo 默认 False:主动搭话冒泡时本句【不落记忆流水】。原因——记忆整理
+        (_check_memory)以"流水有没有新行"作为"要不要起 claude 整理"的零开销门;
+        而整理 prompt 又明确【不记皮卡丘自己说的话】。若把这句没人接的主动开场白写
+        进流水,只会凭空触发一次注定空手而归的整理 claude 调用,违背"无新对话零开销"。
+        用户真接话后,他那几句会照常落流水、带动整理,上下文不受影响。
         """
         text = (text or "").strip()
         if not text:
             return
         self._add("皮卡", text)
         self._history.append((config.PET_NAME,text))
-        self._log_convo("pika", text)
+        if log_convo:
+            self._log_convo("pika", text)
         QTimer.singleShot(30, self._scroll_bottom)
 
     def record_scheduled(self, bubble_text, history_text=None):

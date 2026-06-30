@@ -765,27 +765,44 @@ class PikachuPet(QWidget):
         tail = f"(还有 {more} 条,点我看下一条 ✓)" if more > 0 else "(点我确认 ✓)"
         return f"{text}  {tail}"
 
+    def _clear_pending_proactive(self):
+        """撤掉所有【还挂着没接】的主动搭话:从 sticky 队列剔除其气泡 + 清空话题集。
+
+        用户一旦开窗(任何路径),那些主动开场白都已即时在对话里、被看到了,残留的
+        待点气泡与话题登记都该一并清掉——既释放 _check_proactive 的单条护栏(否则
+        开窗后永远不再冒新主动话题),也不留多余的"点我"气泡。普通定时提醒不受影响:
+        只剔除 _proactive_topics 里登记过的那几条,其余 sticky 提醒原样保留。
+        若被撤的恰好是正在显示的队首,刷新一下让下一条(或空)立即顶上。"""
+        if not self._proactive_topics:
+            return
+        head_before = self._sticky_queue[0] if self._sticky_queue else None
+        self._sticky_queue[:] = [
+            t for t in self._sticky_queue if t not in self._proactive_topics]
+        self._proactive_topics.clear()
+        # 队首若被剔除(或队列变空)→ 重画当前 sticky;否则只刷新角标计数。
+        if head_before is not None and head_before not in self._sticky_queue:
+            self._show_next_sticky()
+        else:
+            self._refresh_sticky_text()
+
     def _on_bubble_clicked(self):
         # 点击 sticky 气泡 = 确认当前这条 → 弹出队列里的下一条(没有则收起)
         # 注:危险操作确认已不走 sticky 队列,改用独立的两按钮 overlay(_ConfirmBubble),
         # 故这里不再有"确认放行"分支——普通提醒/主动搭话气泡才走到这。
         if self._bubble_sticky:
             head = self._sticky_queue[0] if self._sticky_queue else None
-            # 主动搭话气泡:当前队首正是主动话题 → 点击=展开聊天窗接着聊,
-            # 而不是单纯"确认"。先把它出队/收起,再开窗注入开场白。
+            # 主动搭话气泡:当前队首正是主动话题 → 点击=展开聊天窗接着聊(开场白冒泡时
+            # 已即时入对话,不在此注入),而不是单纯"确认"。先把它出队/收起,再开窗。
             is_proactive = head is not None and head in self._proactive_topics
             if self._sticky_queue:
                 self._sticky_queue.pop(0)
             self._show_next_sticky()
             if is_proactive:
+                # 主动话题在冒泡时(_on_proactive_done)就已即时写进聊天窗对话历史,
+                # 这里点击只负责【展开窗口】让用户看到并接话,【不再重复注入】那句话。
                 self._proactive_topics.discard(head)
                 self._last_interact = self._t.elapsed()
                 self.open_chat()
-                if self._chat is not None:
-                    try:
-                        self._chat.inject_pika_opening(head)
-                    except Exception:
-                        pass
 
     def _on_bubble_rejected(self):
         """普通 sticky 气泡的右键:现已无副作用。
@@ -1583,15 +1600,12 @@ class PikachuPet(QWidget):
         else:
             self.open_chat()
 
-    def open_chat(self):
-        self._last_interact = self._t.elapsed()
-        # E4:打开聊天前若本体正走路/跳跃,先立刻停下归位(跳跃落地),再切安静态。
-        # 否则:① 走到一半的位置去定位聊天窗会偏;② 要等当前 walk 到期(最长5s)
-        # 本体才停,这期间它还在移动、和刚弹出的聊天窗脱节。
-        if self._state == "jump":
-            self.move(self.x(), self._jump_base_y)
-        if self._state in ("walk_right", "walk_left", "jump", "sleep", "yawn"):
-            self._set_state("look", 2600)   # 抬头看向你,安静下来
+    def _ensure_chat(self):
+        """惰性建好聊天窗实例并接好信号,但【不显示】。返回 self._chat。
+
+        抽出来给两类调用方共用:open_chat(建完即 show_near)、主动搭话即时注入
+        (建完不显示,只把皮卡丘那句话写进对话历史——见 _on_proactive_done)。
+        幂等:已建好就直接返回,不重复接信号。"""
         if self._chat is None:
             self._chat = ChatWindow()
             # 聊天等 claude 回复时,桌宠本体也进/退思考态呼应
@@ -1602,6 +1616,24 @@ class PikachuPet(QWidget):
             self._chat.on_local_schedule = self._on_local_schedule
             # 收窗不中断 claude:后台跑完时若窗关着,本体冒气泡提醒回来看。
             self._chat.on_background_done = self._on_chat_background_done
+        return self._chat
+
+    def open_chat(self):
+        self._last_interact = self._t.elapsed()
+        # E4:打开聊天前若本体正走路/跳跃,先立刻停下归位(跳跃落地),再切安静态。
+        # 否则:① 走到一半的位置去定位聊天窗会偏;② 要等当前 walk 到期(最长5s)
+        # 本体才停,这期间它还在移动、和刚弹出的聊天窗脱节。
+        if self._state == "jump":
+            self.move(self.x(), self._jump_base_y)
+        if self._state in ("walk_right", "walk_left", "jump", "sleep", "yawn"):
+            self._set_state("look", 2600)   # 抬头看向你,安静下来
+        self._ensure_chat()
+        # 用户开窗 = 已经在看对话了:清掉所有【还挂着没接】的主动话题(它们冒泡时
+        # 就已即时写进对话、此刻用户已能看到),连同其 sticky 气泡一起撤掉。否则:
+        # ① 一条没点过的主动气泡会一直占着 _proactive_topics,让 _check_proactive 的
+        #    单条护栏永久挡住后续所有主动搭话(开窗后再不冒泡);② 用户已看过的开场白
+        #    还残留一个要点的气泡,多余。无论从哪条路径开窗(双击/托盘/点气泡)都统一在此清。
+        self._clear_pending_proactive()
         self._chat.show_near(self.frameGeometry())
         # 聊天窗 show_near 里 raise_()+activateWindow() 会把自己抬到最上盖住本体。
         # 仅靠 showEvent 里设一次 pet level 不够:① activateWindow 是异步的,本帧内
@@ -1872,6 +1904,11 @@ class PikachuPet(QWidget):
         # 已有 worker 在跑就跳过这轮,避免叠加起多个 claude。
         if self._alive_memory_workers() > 0:
             return
+        # ⓪ 单条护栏:已有一条主动话题在队列里等用户处理(还没点开/还没被挤掉)就
+        # 不再发起新的——避免主动气泡堆积、用户被一连串没接的主动话题淹没。定时
+        # 任务/提醒走独立 timer,不受此影响。话题在用户点开或被队列淘汰时清空。
+        if self._proactive_topics:
+            return
         # ① 聊天窗 / thinking
         if self._chat_open() or self._thinking_active:
             return
@@ -1985,9 +2022,21 @@ class PikachuPet(QWidget):
             return
         if self._t.elapsed() - self._last_interact < config.PROACTIVE_IDLE_MIN_MS:
             return
-        # 通过 → 冒主动搭话气泡(sticky,点击展开聊天窗)。记进 set,点击时认得出它。
-        # 封顶兜底:正常情况下话题会在点击或队列淘汰时被 discard,但极端下(从不点击、
-        # 也没触发淘汰)仍可能缓慢累积,超阈值就整体清空(旧话题早已不在显示,清掉无害)。
+        # 通过 → 即时把这句主动搭话写进聊天窗的对话历史,再冒 sticky 气泡。
+        # 先建好(不显示)聊天窗并注入开场白,【成功后】才登记话题 + 冒泡:这样
+        # "气泡/话题登记"与"对话里那句话"始终同生共死——绝不会出现气泡冒了、用户
+        # 点开却是空窗(开场白丢失、后续多轮失去上下文)。万一聊天窗构造/注入失败
+        # (极罕见,如显示层异常),打日志并【跳过本轮】,不留半截状态;下一轮 timer 再试。
+        # 不主动弹窗(避免抢焦点打断用户),展开仍由用户点击/开窗触发。
+        try:
+            self._ensure_chat().inject_pika_opening(topic)
+        except Exception as exc:
+            print(f"[pet] 主动搭话写入聊天窗失败,跳过本轮(不冒泡):{exc}")
+            return
+        # 注入成功 → 登记话题(点击/开窗时认得出它)并冒泡。有了 _check_proactive 的
+        # 单条护栏(已有待处理话题就不发起新的),这个集合实际最多只有 1 条;200 封顶
+        # 仅作未来若放宽护栏时的防膨胀兜底,正常路径不会触达。超阈值整体清空(旧话题
+        # 早已不在显示,清掉无害)。
         if len(self._proactive_topics) >= 200:
             self._proactive_topics.clear()
         self._proactive_topics.add(topic)
