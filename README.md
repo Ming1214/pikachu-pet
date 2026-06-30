@@ -19,7 +19,7 @@
 ![python](https://img.shields.io/badge/Python_3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![pyqt](https://img.shields.io/badge/PyQt6-41CD52?style=for-the-badge&logo=qt&logoColor=white)
 ![claude](https://img.shields.io/badge/Claude_Code-D97757?style=for-the-badge&logo=anthropic&logoColor=white)
-![version](https://img.shields.io/badge/version-0.2.2-FFD23F?style=for-the-badge)
+![version](https://img.shields.io/badge/version-0.2.3-FFD23F?style=for-the-badge)
 
 <br>
 
@@ -366,6 +366,17 @@ pikachu-pet/
 ---
 
 ## 📦 更新日志
+
+### v0.2.3 — 主动搭话:即时入对话 · 不再堆积 🗨️
+
+把「主动搭话」的两处体验打磨到位,并顺手排掉两个隐患:
+
+- **🗨️ 即时入对话** —— 皮卡丘主动找你的那一刻,开场白就**即时写进聊天窗的对话历史**,不必等你点气泡才入对话。你回头点气泡 / 自己开窗时,它已经在对话里、可直接接着聊,上下文连贯。**不主动弹窗**(避免抢焦点打断你),展开仍由你点击触发。
+- **🚦 不再堆积** —— **已有一条主动话题在等你处理时,就不再发起新的**,免得一连串没接的主动气泡把你淹没。定时任务 / 定时提醒走独立线,照常运行、完全不受影响。
+- **🐛 修:摘要零开销回归** —— 主动开场白不再误落记忆流水,否则每次主动冒泡都会凭空触发一次注定空手的后台整理调用,破坏「无新对话零开销」。
+- **🐛 修:主动搭话永久锁死** —— 修复一个潜伏风险:用双击 / 托盘(而非点气泡)开窗时,待处理的主动话题会一直占着登记位、令上面的「不再堆积」护栏**永久挡住后续所有主动搭话**。现在无论从哪条路径开窗都会统一清理待处理话题,护栏正常释放。
+
+> 配套加固:主动开场白「先写进对话成功、才登记话题并冒泡」,杜绝「气泡冒了、点开却是空窗(开场白丢了)」的半截状态。
 
 ### v0.2.2 — 聊天窗跟随桌面(真正修好)🪟
 
